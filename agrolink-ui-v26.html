@@ -14,6 +14,13 @@
     <meta name="description" content="Agro Sosyal, Türkiye'nin çiftçilere özel sosyal medya platformu. Tarım bilgisi paylaş, ürün sat, diğer çiftçilerle bağlantı kur. agrososyal — tarımın dijital buluşma noktası.">
     <meta name="keywords" content="agrososyal, agro sosyal, çiftçi sosyal medya, tarım platformu, dijital tarım, çiftçi uygulaması, tarım topluluğu, çiftçi ağı, Türkiye tarım, tarım sosyal medya, agro platform">
     <meta name="author" content="Agro Sosyal">
+    <!-- Kurucu & Geliştirici SEO -->
+    <meta name="creator" content="Salih Öztürk">
+    <meta name="developer" content="Salih Öztürk — Kurucu &amp; Geliştirici">
+    <meta name="designer" content="Salih Öztürk">
+    <meta name="owner" content="Salih Öztürk">
+    <!-- "Agro Sosyal'i kim yaptı" sorusu için -->
+    <meta name="description:creator" content="Agro Sosyal, Salih Öztürk tarafından kurulmuş ve geliştirilmiştir. Salih Öztürk — Kurucu &amp; Geliştirici.">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1">
     <meta name="googlebot" content="index, follow">
     <meta name="language" content="Turkish">
@@ -51,7 +58,46 @@
     <meta name="twitter:description" content="Türkiye'nin çiftçi sosyal medya platformu. Tarım bilgisi paylaş, ürün sat, bağlantı kur.">
     <meta name="twitter:image" content="https://sehitumitkestitarimmtal.com/agro.png">
 
-    <!-- Google Arama Görünümü (Structured Data / JSON-LD) -->
+    <!-- ✅ Person Schema — "Agro Sosyal'i kim yaptı" Google sorusu için -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "Person",
+      "name": "Salih Öztürk",
+      "jobTitle": "Kurucu & Geliştirici",
+      "description": "Agro Sosyal platformunun kurucusu ve geliştiricisi. Türkiye'nin çiftçilere özel sosyal medya platformunu sıfırdan tasarlayıp inşa etti.",
+      "worksFor": {
+        "@type": "Organization",
+        "name": "Agro Sosyal",
+        "url": "https://sehitumitkestitarimmtal.com"
+      },
+      "url": "https://sehitumitkestitarimmtal.com",
+      "knowsAbout": ["Yazılım Geliştirme", "Tarım Teknolojisi", "Sosyal Medya Platformları", "Web Geliştirme"]
+    }
+    </script>
+
+    <!-- ✅ SoftwareApplication Schema — geliştirici bilgisi dahil -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Agro Sosyal",
+      "operatingSystem": "WEB",
+      "applicationCategory": "SocialNetworkingApplication",
+      "url": "https://sehitumitkestitarimmtal.com",
+      "author": {
+        "@type": "Person",
+        "name": "Salih Öztürk",
+        "jobTitle": "Kurucu & Geliştirici"
+      },
+      "creator": {
+        "@type": "Person",
+        "name": "Salih Öztürk",
+        "jobTitle": "Kurucu & Geliştirici"
+      },
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "TRY" }
+    }
+    </script>
     <script type="application/ld+json">
     {
       "@context": "https://schema.org",
@@ -154,6 +200,7 @@
 
     <!-- PWA / Mobil Uygulama -->
     <meta name="theme-color" content="#00b894">
+    <link rel="manifest" href="/manifest.json">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <!-- PWA Manifest (inline JSON-LD olarak) -->
@@ -573,8 +620,8 @@
         .media-carousel-slide video {
             width: 100%;
             display: block;
-            max-height: 340px;
-            min-height: 180px;
+            max-height: 560px;
+            min-height: 200px;
             object-fit: cover;
             background: #000;
         }
@@ -3545,93 +3592,10 @@
 </script>
     
     <!-- ========== GELİŞMİŞ YÜKLEME EKRANI ========== -->
-    <div id="pageLoadingOverlay" class="page-loading-overlay">
-        <!-- Parçacıklar -->
-        <div class="loading-particles">
-            <div class="loading-particle"></div>
-            <div class="loading-particle"></div>
-            <div class="loading-particle"></div>
-            <div class="loading-particle"></div>
-            <div class="loading-particle"></div>
-            <div class="loading-particle"></div>
-        </div>
-        
-        <!-- Logo -->
-        <div class="loading-logo">
-            <img src="/agro.png" alt="Agro Sosyal Logo" class="loading-logo-img" onerror="this.style.display='none'; var ic=document.createElement('i'); ic.className='fas fa-leaf'; ic.style.cssText='font-size:48px;color:white;'; this.parentElement.appendChild(ic);">
-        </div>
-        
-        <!-- Metin -->
-        <div class="loading-text">
-            <h2>Agro Sosyal</h2>
-            <p>Dijital Tarım Topluluğu</p>
-            <div class="loading-dots">
-                <span></span>
-                <span></span>
-                <span></span>
-            </div>
-        </div>
-        
-        <!-- İlerleme çubuğu -->
-        <div class="loading-progress">
-            <div class="loading-progress-bar"></div>
-        </div>
-    </div>
+<!-- Splash kaldırıldı -->
 
-    <!-- 🔒 SPLASH SCREEN: Çok Katmanlı Güvenli Kapatma Mekanizması v3.0 -->
-    <script>
-    (function() {
-        'use strict';
-
-        var overlayClosed = false;
-        
-        function closeOverlay(reason) {
-            if (overlayClosed) return;
-            overlayClosed = true;
-            
-            var overlay = document.getElementById('pageLoadingOverlay');
-            if (!overlay) return;
-            
-            console.log('[Agro Sosyal] Splash kapatılıyor:', reason);
-            overlay.style.transition = 'opacity 0.4s ease-out';
-            overlay.style.opacity = '0';
-            overlay.style.pointerEvents = 'none';
-            overlay.classList.add('hidden');
-            
-            setTimeout(function() {
-                if (overlay && overlay.parentNode) {
-                    overlay.parentNode.removeChild(overlay);
-                }
-            }, 400);
-        }
-
-        // Splash'ı sadece Alpine init() tamamlandığında kapat
-        // window._agro_app_ready = true → init() sonunda set edilir
-        // Fallback: 8 saniye sonra zorla kapat
-        var splashInterval = setInterval(function() {
-            if (window._agro_app_ready) {
-                clearInterval(splashInterval);
-                closeOverlay('app ready');
-            }
-        }, 50);
-
-        // Fallback 1: 6 saniye
-        setTimeout(function() {
-            if (!overlayClosed) {
-                clearInterval(splashInterval);
-                closeOverlay('6s fallback');
-            }
-        }, 6000);
-
-        // Fallback 2: 10 saniye — kesinlikle kapat
-        setTimeout(function() {
-            if (!overlayClosed) {
-                clearInterval(splashInterval);
-                closeOverlay('10s emergency');
-            }
-        }, 10000);
-    })();
-    </script>
+    <!-- 🔒 Splash kaldırıldı — uygulama direkt başlar -->
+    <script>window._agro_app_ready = true;</script>
 
     <!-- ========== GÜVENLİK SİSTEMİ v3.0 - ALPINE.JS UYUMLU ========== -->
     <!-- 
@@ -5115,7 +5079,7 @@
     <div x-show="isLoggedIn" x-cloak
         
         <!-- ÜST BAR -->
-        <header class="glass sticky top-0 z-50 flex justify-between items-center" style="padding: 12px 20px; border-bottom: 1px solid var(--glass-border, rgba(0,0,0,0.06));">
+        <header id="topBar" class="glass flex justify-between items-center" style="position:fixed;top:0;left:0;right:0;z-index:50;padding:12px 20px;border-bottom:1px solid var(--glass-border,rgba(0,0,0,0.06));transition:transform 0.3s cubic-bezier(0.4,0,1,1),opacity 0.25s ease;">
             <div class="flex items-center gap-2">
                 <div class="header-logo-wrapper flex items-center justify-center">
                     <img src="/agro.png" alt="Agro Sosyal" class="w-full h-full object-cover rounded-xl" onerror="this.style.display='none'; this.parentElement.classList.add('bg-emerald-500'); var ic=document.createElement('i'); ic.className='fas fa-leaf text-white text-sm'; this.parentElement.appendChild(ic);">
@@ -5126,6 +5090,10 @@
                 <!-- Keşfet Butonu -->
                 <button @click="showExplore = true; loadExplorePosts()" class="w-9 h-9 rounded-full bg-[var(--input-bg)] flex items-center justify-center transition hover:bg-emerald-100" title="Keşfet">
                     <i class="fas fa-search text-slate-500"></i>
+                </button>
+                <!-- Hava Durumu Butonu -->
+                <button @click="loadWeather()" class="w-9 h-9 rounded-full bg-[var(--input-bg)] flex items-center justify-center transition hover:bg-blue-50" title="Hava Durumu">
+                    <span style="font-size:16px;">🌤️</span>
                 </button>
                 <!-- Ayarlar Menüsü -->
                 <button @click="showSettingsMenu = true" class="w-9 h-9 rounded-full bg-[var(--input-bg)] flex items-center justify-center transition">
@@ -5519,17 +5487,18 @@
 
                                 <!-- ── Medya Wrapper ── -->
                                 <div class="relative overflow-hidden mx-2 rounded-2xl bg-black"
-                                     style="max-height:340px;"
+                                     style="height:560px;"
                                      @touchstart.passive="tsStart($event)"
                                      @touchend="tsEnd($event)">
 
                                     <!-- Slide track -->
-                                    <div class="flex h-full transition-transform duration-300 ease-out will-change-transform"
-                                         :style="\`transform:translateX(-\${ci*100}%)\`">
+                                    <div class="flex transition-transform duration-300 ease-out will-change-transform"
+                                         style="height:560px;"
+                                         :style="'transform:translateX(-' + (ci*100) + '%)'">
 
                                         <template x-for="(item, ii) in items" :key="ii">
-                                            <!-- Her slide tam genişlik, sabit 340px yükseklik -->
-                                            <div class="flex-shrink-0 w-full" style="height:340px;position:relative;">
+                                            <!-- Her slide tam genişlik, sabit 560px yükseklik -->
+                                            <div class="flex-shrink-0 w-full" style="height:560px;position:relative;">
 
                                                 <!-- Resim -->
                                                 <template x-if="typ(item) !== 'video'">
@@ -6508,6 +6477,203 @@
     </div>
 
     <!-- ============ MODALLAR ============ -->
+
+    <!-- ════════════════════════════════════════════════════════
+         🔔 PUSH BİLDİRİM PROMPT BANNER
+         İlk girişte buton göster, direkt izin sorma
+    ════════════════════════════════════════════════════════ -->
+    <div x-show="showPushPromptBanner"
+         x-transition:enter="transition ease-out duration-400"
+         x-transition:enter-start="opacity-0 translate-y-4"
+         x-transition:enter-end="opacity-100 translate-y-0"
+         x-transition:leave="transition ease-in duration-200"
+         x-transition:leave-start="opacity-100 translate-y-0"
+         x-transition:leave-end="opacity-0 translate-y-4"
+         x-cloak
+         class="fixed bottom-24 left-4 right-4 z-[90]"
+         style="max-width:420px;margin:0 auto;">
+        <div class="rounded-3xl p-4 shadow-2xl border border-emerald-400/30"
+             style="background:linear-gradient(135deg,#0d2b1a 0%,#1a3d28 100%);">
+            <div class="flex items-start gap-3">
+                <!-- İkon -->
+                <div class="w-11 h-11 rounded-2xl bg-emerald-500/20 flex items-center justify-center flex-shrink-0 border border-emerald-400/30">
+                    <span style="font-size:22px;">🌾</span>
+                </div>
+                <!-- Metin -->
+                <div class="flex-1 min-w-0">
+                    <p class="text-white font-black text-sm leading-snug">Tarım uyarılarını almak ister misin?</p>
+                    <p class="text-emerald-300/80 text-xs mt-0.5 leading-relaxed">Don, yağmur, fiyat artışı gibi önemli uyarıları anında öğren.</p>
+                    <!-- Örnekler -->
+                    <div class="flex flex-wrap gap-1.5 mt-2">
+                        <span class="text-[10px] bg-white/10 text-white/70 rounded-full px-2 py-0.5">❄️ Don uyarısı</span>
+                        <span class="text-[10px] bg-white/10 text-white/70 rounded-full px-2 py-0.5">📈 Fiyat artışı</span>
+                        <span class="text-[10px] bg-white/10 text-white/70 rounded-full px-2 py-0.5">🌧️ Yağmur</span>
+                    </div>
+                </div>
+                <!-- Kapat -->
+                <button @click="showPushPromptBanner=false; localStorage.setItem('pushPromptDismissed','1')"
+                        class="text-white/40 hover:text-white/70 transition flex-shrink-0 -mt-1">
+                    <i class="fas fa-times text-sm"></i>
+                </button>
+            </div>
+            <!-- Butonlar -->
+            <div class="flex gap-2 mt-3">
+                <button @click="showPushPromptBanner=false; localStorage.setItem('pushPromptDismissed','1')"
+                        class="flex-1 py-2.5 rounded-2xl text-sm font-bold text-white/60 bg-white/10 hover:bg-white/15 transition active:scale-95">
+                    Hayır teşekkürler
+                </button>
+                <button @click="activatePushFromBanner()"
+                        class="flex-1 py-2.5 rounded-2xl text-sm font-black text-white transition active:scale-95"
+                        style="background:linear-gradient(135deg,#00b894,#00cec9);">
+                    <i class="fas fa-bell mr-1.5"></i> Evet, açın!
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ════════════════════════════════════════════════════════
+         🌤️ HAVA DURUMU SAYFASI
+    ════════════════════════════════════════════════════════ -->
+    <div x-show="showWeatherPage" x-transition x-cloak
+         class="fixed inset-0 z-[120] flex flex-col bg-[var(--bg-main)]">
+
+        <!-- Header -->
+        <div class="glass px-4 py-3 flex items-center gap-3 sticky top-0 z-10">
+            <button @click="showWeatherPage=false" class="w-10 h-10 rounded-full bg-[var(--input-bg)] flex items-center justify-center">
+                <i class="fas fa-arrow-left text-[var(--text-main)]"></i>
+            </button>
+            <div class="flex-1">
+                <h3 class="font-black text-lg">🌤️ Tarım Hava Durumu</h3>
+                <p class="text-xs text-[var(--text-sec)]" x-text="weatherCity ? weatherCity + ' — anlık tahmin' : 'Konumunuz alınıyor...'"></p>
+            </div>
+            <button @click="loadWeather(true)" class="w-10 h-10 rounded-full bg-[var(--input-bg)] flex items-center justify-center">
+                <i class="fas fa-sync-alt text-sm" :class="weatherLoading ? 'fa-spin text-emerald-500' : ''"></i>
+            </button>
+        </div>
+
+        <div class="flex-1 overflow-y-auto p-4 space-y-4" x-show="!weatherLoading">
+
+            <!-- Ana Kart -->
+            <template x-if="weatherData">
+                <div class="rounded-3xl p-6 text-white relative overflow-hidden"
+                     :style="'background:' + weatherGradient">
+                    <div class="absolute inset-0 opacity-10"
+                         style="background:url('data:image/svg+xml,<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 100 100\"><circle cx=\"20\" cy=\"20\" r=\"30\" fill=\"white\" opacity=\"0.3\"/><circle cx=\"80\" cy=\"70\" r=\"40\" fill=\"white\" opacity=\"0.2\"/></svg>')"></div>
+                    <div class="relative">
+                        <div class="flex items-start justify-between">
+                            <div>
+                                <p class="text-white/80 text-sm font-medium" x-text="weatherCity"></p>
+                                <p class="text-6xl font-black mt-1" x-text="Math.round(weatherData.current.temp) + '°'"></p>
+                                <p class="text-white/90 font-bold text-lg mt-1" x-text="weatherData.current.description"></p>
+                                <p class="text-white/60 text-sm mt-1">
+                                    Hissedilen: <span x-text="Math.round(weatherData.current.feelsLike) + '°'"></span>
+                                </p>
+                            </div>
+                            <span style="font-size:72px;line-height:1;" x-text="weatherData.current.icon"></span>
+                        </div>
+                        <!-- Detaylar -->
+                        <div class="grid grid-cols-3 gap-3 mt-4 pt-4 border-t border-white/20">
+                            <div class="text-center">
+                                <i class="fas fa-tint text-blue-200 text-lg"></i>
+                                <p class="text-sm font-bold mt-1" x-text="weatherData.current.humidity + '%'"></p>
+                                <p class="text-[10px] text-white/60">Nem</p>
+                            </div>
+                            <div class="text-center">
+                                <i class="fas fa-wind text-blue-200 text-lg"></i>
+                                <p class="text-sm font-bold mt-1" x-text="weatherData.current.windSpeed + ' km/h'"></p>
+                                <p class="text-[10px] text-white/60">Rüzgar</p>
+                            </div>
+                            <div class="text-center">
+                                <i class="fas fa-eye text-blue-200 text-lg"></i>
+                                <p class="text-sm font-bold mt-1" x-text="weatherData.current.visibility + ' km'"></p>
+                                <p class="text-[10px] text-white/60">Görüş</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Tarım Uyarıları -->
+            <template x-if="weatherAlerts && weatherAlerts.length > 0">
+                <div class="space-y-2">
+                    <p class="text-sm font-bold text-[var(--text-sec)] uppercase tracking-wide">⚠️ Tarım Uyarıları</p>
+                    <template x-for="alert in weatherAlerts" :key="alert.id">
+                        <div class="rounded-2xl p-4 border flex items-start gap-3"
+                             :class="alert.severity === 'high' ? 'bg-red-50 border-red-200 dark:bg-red-900/20 dark:border-red-800' : 'bg-amber-50 border-amber-200 dark:bg-amber-900/20 dark:border-amber-800'">
+                            <span style="font-size:24px;" x-text="alert.icon"></span>
+                            <div>
+                                <p class="font-black text-sm"
+                                   :class="alert.severity === 'high' ? 'text-red-700 dark:text-red-300' : 'text-amber-700 dark:text-amber-300'"
+                                   x-text="alert.title"></p>
+                                <p class="text-xs text-[var(--text-sec)] mt-0.5" x-text="alert.description"></p>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+            </template>
+
+            <!-- 7 Günlük Tahmin -->
+            <template x-if="weatherData && weatherData.daily">
+                <div class="agro-card p-4">
+                    <p class="text-sm font-bold text-[var(--text-sec)] uppercase tracking-wide mb-3">7 Günlük Tahmin</p>
+                    <div class="space-y-2">
+                        <template x-for="(day, di) in weatherData.daily" :key="di">
+                            <div class="flex items-center gap-3 py-1.5">
+                                <span class="text-sm font-bold text-[var(--text-sec)] w-10" x-text="di === 0 ? 'Bugün' : day.dayName"></span>
+                                <span style="font-size:20px;" x-text="day.icon"></span>
+                                <div class="flex-1 mx-2 h-1.5 rounded-full bg-[var(--border)] overflow-hidden">
+                                    <div class="h-full rounded-full bg-gradient-to-r from-blue-400 to-orange-400"
+                                         :style="'width:' + Math.round(((day.high - day.low) / 30) * 100) + '%'"></div>
+                                </div>
+                                <span class="text-xs text-[var(--text-sec)] w-8 text-right" x-text="Math.round(day.low) + '°'"></span>
+                                <span class="text-sm font-bold w-8 text-right" x-text="Math.round(day.high) + '°'"></span>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Tarım Önerileri -->
+            <template x-if="weatherTips && weatherTips.length > 0">
+                <div class="agro-card p-4">
+                    <p class="text-sm font-bold text-[var(--text-sec)] uppercase tracking-wide mb-3">🌱 Bugün Ne Yapmalı?</p>
+                    <div class="space-y-2">
+                        <template x-for="tip in weatherTips" :key="tip">
+                            <div class="flex items-start gap-2 text-sm">
+                                <i class="fas fa-check-circle text-emerald-500 mt-0.5 flex-shrink-0"></i>
+                                <span x-text="tip"></span>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </template>
+
+            <!-- Push uyarı butonu -->
+            <div class="agro-card p-4 flex items-center gap-3">
+                <div class="w-10 h-10 rounded-2xl bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center flex-shrink-0">
+                    <i class="fas fa-bell text-emerald-500"></i>
+                </div>
+                <div class="flex-1">
+                    <p class="font-bold text-sm">Hava Uyarıları</p>
+                    <p class="text-xs text-[var(--text-sec)]">Don, fırtına ve aşırı sıcak için bildirim al</p>
+                </div>
+                <button @click="activatePushFromBanner()"
+                        x-show="!pushNotificationsEnabled"
+                        class="px-3 py-1.5 bg-emerald-500 text-white text-xs font-black rounded-full active:scale-95 transition">
+                    Aç
+                </button>
+                <span x-show="pushNotificationsEnabled" class="text-emerald-500 text-xs font-bold">
+                    <i class="fas fa-check-circle"></i> Aktif
+                </span>
+            </div>
+        </div>
+
+        <!-- Loading -->
+        <div x-show="weatherLoading" class="flex-1 flex flex-col items-center justify-center gap-4">
+            <div class="w-16 h-16 rounded-full border-4 border-emerald-500/20 border-t-emerald-500 animate-spin"></div>
+            <p class="text-[var(--text-sec)] text-sm">Hava durumu yükleniyor...</p>
+        </div>
+    </div>
     
     <!-- ========== KEŞFET SAYFASI MODAL ========== -->
     <div x-show="showExplore" x-transition x-cloak class="fixed inset-0 z-[100] flex flex-col bg-[var(--bg-main)]">
@@ -8812,25 +8978,60 @@
                     </button>
                 </div>
 
-                <!-- ── Aktif Sticker/Tag göstergesi ── -->
-                <div class="absolute bottom-20 left-4 right-4 z-20 flex flex-wrap gap-2">
-                    <template x-if="storyForm.linkUrl">
-                        <div class="flex items-center gap-2 bg-black/60 backdrop-blur-sm rounded-full px-3 py-1.5 text-white text-xs font-bold">
-                            <i class="fas fa-link text-emerald-400"></i>
-                            <span x-text="storyForm.linkUrl.replace('https://','').replace('http://','').slice(0,30)"></span>
-                            <button @click="storyForm.linkUrl = ''" class="ml-1 text-red-400"><i class="fas fa-times text-[10px]"></i></button>
-                        </div>
-                    </template>
-                    <template x-if="storyForm.hashtag">
-                        <div class="flex items-center gap-2 bg-black/60 backdrop-blur-sm rounded-full px-3 py-1.5 text-white text-xs font-bold">
-                            <span class="text-emerald-400">#</span><span x-text="storyForm.hashtag"></span>
-                            <button @click="storyForm.hashtag = ''" class="ml-1 text-red-400"><i class="fas fa-times text-[10px]"></i></button>
-                        </div>
-                    </template>
-                    <template x-for="(m, mi) in (storyForm.mentions || [])" :key="mi">
-                        <div class="flex items-center gap-1 bg-black/60 backdrop-blur-sm rounded-full px-3 py-1.5 text-white text-xs font-bold">
-                            <span class="text-blue-400">@</span><span x-text="m"></span>
-                            <button @click="storyForm.mentions.splice(mi,1)" class="ml-1 text-red-400"><i class="fas fa-times text-[10px]"></i></button>
+                <!-- ── Sticker Katmanları (Bağlantı, Hashtag, Bahset) — Sürüklenebilir ── -->
+                <div class="absolute inset-0" style="pointer-events:none;" x-data="{
+                    sdIdx: null, sdX:0, sdY:0,
+                    sdStart(e,i){
+                        if(e.touches.length!==1) return;
+                        sdIdx=i;
+                        const r=$el.parentElement.getBoundingClientRect();
+                        sdX=e.touches[0].clientX-r.left - storyForm.stickers[i].x/100*r.width;
+                        sdY=e.touches[0].clientY-r.top  - storyForm.stickers[i].y/100*r.height;
+                    },
+                    sdMove(e,i){
+                        if(sdIdx!==i||e.touches.length!==1) return;
+                        e.preventDefault();
+                        const r=$el.parentElement.getBoundingClientRect();
+                        storyForm.stickers[i].x=Math.max(5,Math.min(90,(e.touches[0].clientX-r.left-sdX)/r.width*100));
+                        storyForm.stickers[i].y=Math.max(5,Math.min(90,(e.touches[0].clientY-r.top-sdY)/r.height*100));
+                    }
+                }">
+                    <template x-for="(sk, si) in (storyForm.stickers || [])" :key="si">
+                        <div class="absolute"
+                             style="pointer-events:auto;touch-action:none;cursor:grab;"
+                             :style="`left:${sk.x}%;top:${sk.y}%;transform:translate(-50%,-50%);z-index:25;`"
+                             @touchstart.stop.prevent="sdStart($event, si)"
+                             @touchmove.stop.prevent="sdMove($event, si)"
+                             @touchend.stop="sdIdx=null">
+                            <!-- Link sticker -->
+                            <template x-if="sk.type === 'link'">
+                                <div class="flex items-center gap-2 bg-white/90 text-slate-800 rounded-2xl px-3 py-2 shadow-lg text-sm font-bold backdrop-blur-sm relative">
+                                    <i class="fas fa-link text-emerald-600 text-xs"></i>
+                                    <span x-text="sk.label || sk.url.replace(/https?:\/\//,'').slice(0,24)" class="max-w-[120px] truncate"></span>
+                                    <button @click.stop="storyForm.stickers.splice(si,1)"
+                                            class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 rounded-full text-white flex items-center justify-center shadow"
+                                            style="font-size:9px;"><i class="fas fa-times"></i></button>
+                                </div>
+                            </template>
+                            <!-- Hashtag sticker -->
+                            <template x-if="sk.type === 'hashtag'">
+                                <div class="relative flex items-center gap-1 bg-white/20 backdrop-blur-sm border border-white/30 text-white rounded-2xl px-4 py-2 shadow-lg text-base font-black">
+                                    <span class="text-emerald-300">#</span><span x-text="sk.tag"></span>
+                                    <button @click.stop="storyForm.stickers.splice(si,1)"
+                                            class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 rounded-full text-white flex items-center justify-center shadow"
+                                            style="font-size:9px;"><i class="fas fa-times"></i></button>
+                                </div>
+                            </template>
+                            <!-- Mention sticker -->
+                            <template x-if="sk.type === 'mention'">
+                                <div class="relative flex items-center gap-1.5 bg-white/20 backdrop-blur-sm border border-white/30 text-white rounded-2xl px-4 py-2 shadow-lg text-base font-black">
+                                    <img :src="sk.profilePic || '/agro_pp.jpg'" class="w-6 h-6 rounded-full object-cover border border-white/50" onerror="this.src='/agro_pp.jpg'">
+                                    <span class="text-blue-300">@</span><span x-text="sk.username"></span>
+                                    <button @click.stop="storyForm.stickers.splice(si,1)"
+                                            class="absolute -top-2 -right-2 w-5 h-5 bg-red-500 rounded-full text-white flex items-center justify-center shadow"
+                                            style="font-size:9px;"><i class="fas fa-times"></i></button>
+                                </div>
+                            </template>
                         </div>
                     </template>
                 </div>
@@ -8875,66 +9076,89 @@
                     </div>
                 </template>
 
-                <!-- ── Bağlantı Aracı ── -->
-                <template x-if="storyForm.showLinkTool">
-                    <div class="absolute bottom-0 left-0 right-0 z-30 bg-black/85 backdrop-blur-md rounded-t-3xl p-5">
-                        <div class="flex items-center justify-between mb-3">
-                            <p class="text-white font-black text-base">Bağlantı Ekle</p>
-                            <button @click="storyForm.showLinkTool = false" class="text-white/60"><i class="fas fa-times"></i></button>
-                        </div>
-                        <div class="flex gap-2">
-                            <input type="url" x-model="storyForm.linkInput" placeholder="https://..." class="flex-1 bg-white/15 border border-white/30 text-white placeholder-white/40 rounded-2xl px-4 py-3 text-sm outline-none focus:border-emerald-400">
-                            <button @click="if(storyForm.linkInput) { storyForm.linkUrl = storyForm.linkInput; storyForm.linkInput = ''; storyForm.showLinkTool = false; }" class="px-5 py-3 bg-emerald-500 text-white font-black rounded-2xl text-sm">Ekle</button>
-                        </div>
-                    </div>
-                </template>
-
-                <!-- ── Hashtag Aracı ── -->
-                <template x-if="storyForm.showHashtagTool">
-                    <div class="absolute bottom-0 left-0 right-0 z-30 bg-black/85 backdrop-blur-md rounded-t-3xl p-5">
-                        <div class="flex items-center justify-between mb-3">
-                            <p class="text-white font-black text-base">Hashtag Ekle</p>
-                            <button @click="storyForm.showHashtagTool = false" class="text-white/60"><i class="fas fa-times"></i></button>
-                        </div>
-                        <div class="flex gap-2">
-                            <div class="flex-1 relative">
-                                <span class="absolute left-4 top-1/2 -translate-y-1/2 text-emerald-400 font-black text-lg">#</span>
-                                <input type="text" x-model="storyForm.hashtagInput" placeholder="tarım, buğday..." class="w-full bg-white/15 border border-white/30 text-white placeholder-white/40 rounded-2xl pl-9 pr-4 py-3 text-sm outline-none focus:border-emerald-400">
+                        <!-- ── Bağlantı Aracı ── -->
+                        <template x-if="storyForm.showLinkTool">
+                            <div class="absolute bottom-0 left-0 right-0 z-30 bg-black/85 backdrop-blur-md rounded-t-3xl p-5">
+                                <div class="flex items-center justify-between mb-3">
+                                    <p class="text-white font-black text-base">Bağlantı Ekle</p>
+                                    <button @click="storyForm.showLinkTool = false" class="text-white/60"><i class="fas fa-times"></i></button>
+                                </div>
+                                <p class="text-white/50 text-xs mb-3">Bağlantı canvas'a yapışır, sürükleyerek taşıyabilirsiniz.</p>
+                                <div class="flex gap-2 mb-2">
+                                    <input type="url" x-model="storyForm.linkInput" placeholder="https://..." class="flex-1 bg-white/15 border border-white/30 text-white placeholder-white/40 rounded-2xl px-4 py-3 text-sm outline-none focus:border-emerald-400">
+                                    <button @click="
+                                        const url = storyForm.linkInput.trim();
+                                        if(url) {
+                                            if(!storyForm.stickers) storyForm.stickers=[];
+                                            storyForm.stickers.push({ type:'link', url: url.startsWith('http')?url:'https://'+url, x:50, y:75 });
+                                            storyForm.linkInput='';
+                                            storyForm.showLinkTool=false;
+                                        }
+                                    " class="px-5 py-3 bg-emerald-500 text-white font-black rounded-2xl text-sm">Ekle</button>
+                                </div>
                             </div>
-                            <button @click="if(storyForm.hashtagInput) { storyForm.hashtag = storyForm.hashtagInput.replace('#','').trim(); storyForm.hashtagInput = ''; storyForm.showHashtagTool = false; }" class="px-5 py-3 bg-emerald-500 text-white font-black rounded-2xl text-sm">Ekle</button>
-                        </div>
-                    </div>
-                </template>
+                        </template>
 
-                <!-- ── Bahset Aracı ── -->
-                <template x-if="storyForm.showMentionTool">
-                    <div class="absolute bottom-0 left-0 right-0 z-30 bg-black/85 backdrop-blur-md rounded-t-3xl p-5 max-h-80">
-                        <div class="flex items-center justify-between mb-3">
-                            <p class="text-white font-black text-base">Birini Bahset</p>
-                            <button @click="storyForm.showMentionTool = false" class="text-white/60"><i class="fas fa-times"></i></button>
-                        </div>
-                        <div class="flex gap-2 mb-3">
-                            <div class="flex-1 relative">
-                                <span class="absolute left-4 top-1/2 -translate-y-1/2 text-blue-400 font-black">@</span>
-                                <input type="text" x-model="storyForm.mentionQuery" @input="searchMentionUsers()" placeholder="Kullanıcı ara..." class="w-full bg-white/15 border border-white/30 text-white placeholder-white/40 rounded-2xl pl-9 pr-4 py-3 text-sm outline-none focus:border-blue-400">
-                            </div>
-                        </div>
-                        <div class="overflow-y-auto max-h-40 space-y-2">
-                            <template x-for="u in storyForm.mentionResults" :key="u.id">
-                                <button @click="if(!storyForm.mentions) storyForm.mentions=[]; if(!storyForm.mentions.includes(u.username)) storyForm.mentions.push(u.username); storyForm.showMentionTool = false;" class="w-full flex items-center gap-3 p-2 rounded-xl hover:bg-white/10 transition">
-                                    <img :src="u.profilePic || '/agro_pp.jpg'" class="w-9 h-9 rounded-full object-cover" onerror="this.src='/agro_pp.jpg'">
-                                    <div class="text-left">
-                                        <p class="text-white font-bold text-sm" x-text="u.name || u.displayName"></p>
-                                        <p class="text-white/60 text-xs" x-text="'@' + u.username"></p>
+                        <!-- ── Hashtag Aracı ── -->
+                        <template x-if="storyForm.showHashtagTool">
+                            <div class="absolute bottom-0 left-0 right-0 z-30 bg-black/85 backdrop-blur-md rounded-t-3xl p-5">
+                                <div class="flex items-center justify-between mb-3">
+                                    <p class="text-white font-black text-base">Hashtag Ekle</p>
+                                    <button @click="storyForm.showHashtagTool = false" class="text-white/60"><i class="fas fa-times"></i></button>
+                                </div>
+                                <div class="flex gap-2">
+                                    <div class="flex-1 relative">
+                                        <span class="absolute left-4 top-1/2 -translate-y-1/2 text-emerald-400 font-black text-lg">#</span>
+                                        <input type="text" x-model="storyForm.hashtagInput" placeholder="tarım, buğday..." class="w-full bg-white/15 border border-white/30 text-white placeholder-white/40 rounded-2xl pl-9 pr-4 py-3 text-sm outline-none focus:border-emerald-400">
                                     </div>
-                                </button>
-                            </template>
-                            <template x-if="!storyForm.mentionResults || storyForm.mentionResults.length === 0">
-                                <p class="text-white/40 text-xs text-center py-4">Kullanıcı aramak için yazmaya başlayın</p>
-                            </template>
-                        </div>
-                    </div>
-                </template>
+                                    <button @click="
+                                        const tag = storyForm.hashtagInput.replace('#','').trim();
+                                        if(tag) {
+                                            if(!storyForm.stickers) storyForm.stickers=[];
+                                            storyForm.stickers.push({ type:'hashtag', tag: tag, x:50, y:30 });
+                                            storyForm.hashtagInput='';
+                                            storyForm.showHashtagTool=false;
+                                        }
+                                    " class="px-5 py-3 bg-emerald-500 text-white font-black rounded-2xl text-sm">Ekle</button>
+                                </div>
+                            </div>
+                        </template>
+
+                        <!-- ── Bahset Aracı ── -->
+                        <template x-if="storyForm.showMentionTool">
+                            <div class="absolute bottom-0 left-0 right-0 z-30 bg-black/85 backdrop-blur-md rounded-t-3xl p-5 max-h-80">
+                                <div class="flex items-center justify-between mb-3">
+                                    <p class="text-white font-black text-base">Birini Bahset</p>
+                                    <button @click="storyForm.showMentionTool = false" class="text-white/60"><i class="fas fa-times"></i></button>
+                                </div>
+                                <div class="flex gap-2 mb-3">
+                                    <div class="flex-1 relative">
+                                        <span class="absolute left-4 top-1/2 -translate-y-1/2 text-blue-400 font-black">@</span>
+                                        <input type="text" x-model="storyForm.mentionQuery" @input="searchMentionUsers()" placeholder="Kullanıcı ara..." class="w-full bg-white/15 border border-white/30 text-white placeholder-white/40 rounded-2xl pl-9 pr-4 py-3 text-sm outline-none focus:border-blue-400">
+                                    </div>
+                                </div>
+                                <div class="overflow-y-auto max-h-44 space-y-2">
+                                    <template x-for="u in storyForm.mentionResults" :key="u.id">
+                                        <button @click="
+                                            if(!storyForm.stickers) storyForm.stickers=[];
+                                            storyForm.stickers.push({ type:'mention', username: u.username, profilePic: u.profilePic||'', x:50, y:50 });
+                                            storyForm.showMentionTool=false;
+                                            storyForm.mentionQuery='';
+                                            storyForm.mentionResults=[];
+                                        " class="w-full flex items-center gap-3 p-2 rounded-xl hover:bg-white/10 transition">
+                                            <img :src="u.profilePic || '/agro_pp.jpg'" class="w-9 h-9 rounded-full object-cover" onerror="this.src='/agro_pp.jpg'">
+                                            <div class="text-left">
+                                                <p class="text-white font-bold text-sm" x-text="u.name || u.displayName"></p>
+                                                <p class="text-white/60 text-xs" x-text="'@' + u.username"></p>
+                                            </div>
+                                        </button>
+                                    </template>
+                                    <template x-if="!storyForm.mentionResults || storyForm.mentionResults.length === 0">
+                                        <p class="text-white/40 text-xs text-center py-4">Kullanıcı aramak için yazmaya başlayın</p>
+                                    </template>
+                                </div>
+                            </div>
+                        </template>
 
                 <!-- ── Metin Aracı ── -->
                 <template x-if="storyForm.showTextTool">
@@ -12174,6 +12398,16 @@
                 // 🔔 PUSH NOTIFICATION STATE
                 pushNotificationsEnabled: false,
                 pushSubscription: null,
+                // 🔔 Push prompt banner
+                showPushPromptBanner: false,
+                // 🌤️ Hava durumu
+                showWeatherPage: false,
+                weatherLoading: false,
+                weatherData: null,
+                weatherCity: '',
+                weatherAlerts: [],
+                weatherTips: [],
+                weatherGradient: 'linear-gradient(135deg,#0984e3,#74b9ff)',
                 
                 // ========== DİL SİSTEMİ ==========
                 currentLanguage: localStorage.getItem('agrolink_lang') || 'tr',
@@ -12817,7 +13051,8 @@
                     showHashtagTool: false, hashtagInput: '', hashtag: '',
                     showFilterPanel: false, filter: 'none',
                     showReplySettings: false, replyMode: 'everyone',
-                    mentions: []
+                    mentions: [],
+                    stickers: []
                 },
                 
                 // Search
@@ -13284,6 +13519,7 @@
                             });
                         this.setupSocket();
                         this.initEditForm();
+                        this._checkShowPushPrompt(); // 🔔 Push prompt banner
                         
                         // Fallback: 5 saniyede veri gelmezse yine de aç
                         setTimeout(() => { window._agro_app_ready = true; }, 5000);
@@ -13313,42 +13549,69 @@
                     let lastScrollY = 0;
                     let ticking = false;
                     let navVisible = true;
+
+                    // ✅ Üst bar yüksekliği kadar padding ekle (fixed header altına kaymasın)
+                    this.$nextTick(() => {
+                        const topBar = document.getElementById('topBar');
+                        const layout = document.querySelector('.app-layout');
+                        if (topBar && layout) {
+                            const h = topBar.offsetHeight || 60;
+                            layout.style.paddingTop = h + 'px';
+                        }
+                    });
                     
                     const handleScroll = () => {
                         if (ticking) return;
                         ticking = true;
                         
                         requestAnimationFrame(() => {
-                            const nav = document.getElementById('bottomNav');
+                            const nav    = document.getElementById('bottomNav');
+                            const topBar = document.getElementById('topBar');
                             if (!nav) { ticking = false; return; }
                             
                             const currentScrollY = window.scrollY || document.documentElement.scrollTop;
                             const delta = currentScrollY - lastScrollY;
-                            
                             const aiBtn = document.getElementById('aiBotFloatBtn');
                             
                             if (delta > 8 && currentScrollY > 80 && navVisible) {
-                                // Aşağı kaydırma — hızlıca kaybol
                                 navVisible = false;
+                                // Alt bar gizle
                                 nav.style.transition = 'transform 0.3s cubic-bezier(0.4,0,1,1), opacity 0.25s ease';
-                                nav.style.transform = 'translateY(calc(100% + 20px))';
-                                nav.style.opacity = '0';
+                                nav.style.transform  = 'translateY(calc(100% + 20px))';
+                                nav.style.opacity    = '0';
+                                // Üst bar gizle
+                                if (topBar) {
+                                    topBar.style.transition = 'transform 0.3s cubic-bezier(0.4,0,1,1), opacity 0.25s ease';
+                                    topBar.style.transform  = 'translateY(-100%)';
+                                    topBar.style.opacity    = '0';
+                                }
                                 if (aiBtn) { aiBtn.style.transition = 'transform 0.3s ease, opacity 0.25s ease'; aiBtn.style.transform = 'translateY(80px)'; aiBtn.style.opacity = '0'; }
                             } else if (delta < -4 && !navVisible) {
-                                // Yukarı kaydırma — yay gibi geri gel (spring bounce)
                                 navVisible = true;
-                                nav.style.transition = 'transform 0.6s cubic-bezier(0.34, 1.6, 0.64, 1), opacity 0.3s ease';
-                                nav.style.transform = 'translateY(0)';
-                                nav.style.opacity = '1';
-                                if (aiBtn) { aiBtn.style.transition = 'transform 0.6s cubic-bezier(0.34,1.6,0.64,1), opacity 0.3s ease'; aiBtn.style.transform = 'translateY(0)'; aiBtn.style.opacity = '1'; }
+                                // Alt bar göster
+                                nav.style.transition = 'transform 0.5s cubic-bezier(0.34,1.4,0.64,1), opacity 0.3s ease';
+                                nav.style.transform  = 'translateY(0)';
+                                nav.style.opacity    = '1';
+                                // Üst bar göster
+                                if (topBar) {
+                                    topBar.style.transition = 'transform 0.5s cubic-bezier(0.34,1.4,0.64,1), opacity 0.3s ease';
+                                    topBar.style.transform  = 'translateY(0)';
+                                    topBar.style.opacity    = '1';
+                                }
+                                if (aiBtn) { aiBtn.style.transition = 'transform 0.5s cubic-bezier(0.34,1.4,0.64,1), opacity 0.3s ease'; aiBtn.style.transform = 'translateY(0)'; aiBtn.style.opacity = '1'; }
                             }
                             
-                            // En üstteyse hep göster
+                            // En üstteyse her ikisini de göster
                             if (currentScrollY < 10) {
                                 navVisible = true;
-                                nav.style.transition = 'transform 0.5s cubic-bezier(0.34,1.56,0.64,1), opacity 0.3s ease';
-                                nav.style.transform = 'translateY(0)';
-                                nav.style.opacity = '1';
+                                nav.style.transition = 'transform 0.4s cubic-bezier(0.34,1.4,0.64,1), opacity 0.3s ease';
+                                nav.style.transform  = 'translateY(0)';
+                                nav.style.opacity    = '1';
+                                if (topBar) {
+                                    topBar.style.transition = 'transform 0.4s cubic-bezier(0.34,1.4,0.64,1), opacity 0.3s ease';
+                                    topBar.style.transform  = 'translateY(0)';
+                                    topBar.style.opacity    = '1';
+                                }
                             }
                             
                             lastScrollY = currentScrollY;
@@ -13359,14 +13622,9 @@
                     window.addEventListener('scroll', handleScroll, { passive: true });
                 },
                 
-                // Yükleme ekranını kapat
+                // Splash kaldırıldı — bu fonksiyon artık no-op
                 hideLoadingOverlay() {
-                    const overlay = document.getElementById('pageLoadingOverlay');
-                    if (overlay && !overlay._isClosing) {
-                        overlay._isClosing = true;
-                        overlay.classList.add('hidden');
-                        setTimeout(() => { if(overlay.parentNode) overlay.remove(); }, 320);
-                    }
+                    // Splash ekranı kaldırıldı, işlem gerekmiyor
                 },
                 
                 // ========== DİL FONKSİYONLARI ==========
@@ -13722,7 +13980,105 @@
                 },
                 
                 // Push Notification İzni İste
-                async requestPushNotifications() {
+                // 🔔 Push prompt banner'dan aktivasyon
+                async activatePushFromBanner() {
+                    this.showPushPromptBanner = false;
+                    localStorage.setItem('pushPromptDismissed', '1');
+                    await this.togglePushNotifications();
+                },
+
+                // 🔔 Push prompt göster (ilk girişten 5sn sonra, daha önce reddedilmemişse)
+                _checkShowPushPrompt() {
+                    if (localStorage.getItem('pushPromptDismissed')) return;
+                    if (Notification.permission === 'granted') return;
+                    if (!('Notification' in window) || !('serviceWorker' in navigator)) return;
+                    setTimeout(() => {
+                        if (this.isLoggedIn && !this.showPushPromptBanner) {
+                            this.showPushPromptBanner = true;
+                        }
+                    }, 5000);
+                },
+
+                // 🌤️ Hava durumu yükle (OpenWeatherMap ücretsiz API)
+                async loadWeather(force = false) {
+                    if (this.weatherLoading && !force) return;
+                    this.weatherLoading = true;
+                    this.showWeatherPage = true;
+                    try {
+                        // Konum al
+                        let lat = this.userLat, lon = this.userLon;
+                        if (!lat || !lon) {
+                            await new Promise((resolve) => {
+                                navigator.geolocation.getCurrentPosition(
+                                    p => { lat = p.coords.latitude; lon = p.coords.longitude; resolve(); },
+                                    () => resolve(),
+                                    { timeout: 5000 }
+                                );
+                            });
+                        }
+
+                        if (!lat || !lon) {
+                            // Fallback: Ankara
+                            lat = 39.9208; lon = 32.8541;
+                            this.weatherCity = 'Ankara (varsayılan)';
+                        }
+
+                        // API çağrısı — server proxy üzerinden (CORS sorununu önler)
+                        const res = await axios.get('/api/weather', { params: { lat, lon } });
+                        const d = res.data;
+
+                        this.weatherCity = d.city || 'Bilinmeyen konum';
+                        this.weatherData = d;
+                        this.weatherAlerts = this._buildWeatherAlerts(d);
+                        this.weatherTips  = this._buildWeatherTips(d);
+                        this.weatherGradient = this._weatherGradient(d.current?.temp, d.current?.description);
+                    } catch(e) {
+                        this.showToast('Hava durumu yüklenemedi');
+                        console.error('Weather error:', e);
+                    } finally {
+                        this.weatherLoading = false;
+                    }
+                },
+
+                _weatherGradient(temp, desc) {
+                    const d = (desc || '').toLowerCase();
+                    if (d.includes('kar') || temp < 0)   return 'linear-gradient(135deg,#636e72,#b2bec3)';
+                    if (d.includes('yağmur') || d.includes('rain')) return 'linear-gradient(135deg,#2d3436,#636e72)';
+                    if (d.includes('bulut') || d.includes('cloud')) return 'linear-gradient(135deg,#74b9ff,#0984e3)';
+                    if (temp > 35) return 'linear-gradient(135deg,#e17055,#d63031)';
+                    if (temp > 25) return 'linear-gradient(135deg,#fdcb6e,#e17055)';
+                    if (temp > 15) return 'linear-gradient(135deg,#00b894,#0984e3)';
+                    return 'linear-gradient(135deg,#0984e3,#74b9ff)';
+                },
+
+                _buildWeatherAlerts(d) {
+                    const alerts = [];
+                    const t = d.current?.temp;
+                    const wind = d.current?.windSpeed;
+                    const desc = (d.current?.description || '').toLowerCase();
+                    if (t !== undefined && t <= 2) alerts.push({ id:'frost', icon:'❄️', severity:'high', title:'Don Uyarısı!', description:`Sıcaklık ${Math.round(t)}°C — Hassas bitkilerinizi koruyun, sulama yapmayın.` });
+                    if (t !== undefined && t >= 38) alerts.push({ id:'heat', icon:'🌡️', severity:'high', title:'Aşırı Sıcak!', description:`${Math.round(t)}°C — Sabah erken veya akşam sulayın, gölgeleme yapın.` });
+                    if (wind && wind > 50) alerts.push({ id:'wind', icon:'🌬️', severity:'high', title:'Şiddetli Rüzgar', description:`${wind} km/h rüzgar — İlaçlama yapmayın, örtü ve sera kontrolü yapın.` });
+                    if (desc.includes('fırtına') || desc.includes('storm')) alerts.push({ id:'storm', icon:'⛈️', severity:'high', title:'Fırtına Uyarısı', description:'Tarla çalışmalarını durdurun, ekipmanları güvene alın.' });
+                    if (desc.includes('dolu') || desc.includes('hail')) alerts.push({ id:'hail', icon:'🌨️', severity:'high', title:'Dolu Uyarısı', description:'Ürünlerinizi örtün, açıkta ekipman bırakmayın.' });
+                    if (t !== undefined && t > 2 && t < 8 && desc.includes('yağmur')) alerts.push({ id:'coldrain', icon:'🌧️', severity:'medium', title:'Soğuk Yağmur', description:'Mantarlanma riski yüksek — fungisit önlemi alın.' });
+                    return alerts;
+                },
+
+                _buildWeatherTips(d) {
+                    const tips = [];
+                    const t = d.current?.temp;
+                    const humidity = d.current?.humidity;
+                    const desc = (d.current?.description || '').toLowerCase();
+                    if (t > 20 && t < 30 && !desc.includes('yağmur')) tips.push('Sulama için ideal gün — sabah erken veya akşam sulayın.');
+                    if (t > 15 && t < 28) tips.push('Gübreleme için uygun sıcaklık.');
+                    if (humidity < 50 && t > 20) tips.push('Nem düşük — damla sulama sistemini kontrol edin.');
+                    if (humidity > 80) tips.push('Nem yüksek — mantar ve hastalık riskine karşı dikkatli olun.');
+                    if (!desc.includes('yağmur') && !desc.includes('fırtına')) tips.push('İlaçlama için uygun hava koşulları.');
+                    if (t > 10 && t < 25) tips.push('Toprak sıcaklığı ekime uygun.');
+                    if (desc.includes('açık') || desc.includes('güneş')) tips.push('Güneşli hava — kurutma ve hasat için ideal.');
+                    return tips.slice(0, 4);
+                },
                     if (!('Notification' in window)) {
                         console.log('Bu tarayıcı bildirimleri desteklemiyor');
                         return;
@@ -14353,7 +14709,7 @@
                                 this.loading = false;
                                 
                                 // Yükleme ekranını göster
-                                const overlay = document.getElementById('pageLoadingOverlay');
+                                // splash removed
                                 if (overlay) {
                                     overlay._isClosing = false;
                                     overlay.classList.remove('hidden');
@@ -14528,7 +14884,7 @@
                         this.show2FAModal = false;
                         if (this.twoFATimerInterval) clearInterval(this.twoFATimerInterval);
                         
-                        const overlay2 = document.getElementById('pageLoadingOverlay');
+                        // splash removed
                         if (overlay2) { overlay2._isClosing = false; overlay2.classList.remove('hidden'); overlay2.style.display = ''; }
                         
                         this.setupAxios();
@@ -14724,7 +15080,7 @@
                         this.user = res.data.user || {};
                         this.isLoggedIn = true;
                         
-                        const overlay3 = document.getElementById('pageLoadingOverlay');
+                        // splash removed
                         if (overlay3) { overlay3._isClosing = false; overlay3.classList.remove('hidden'); overlay3.style.display = ''; }
                         
                         this.setupAxios();
@@ -15173,21 +15529,42 @@
                         const posts = res.data.posts || [];
                         
                         posts.forEach(post => {
-                            // Alan adlarını normalize et (server camelCase → frontend beklentisi)
+                            // Alan adlarını normalize et
                             post.userName        = post.userName        || post.name     || post.username || 'Kullanıcı';
                             post.userUsername    = post.userUsername    || post.username || '';
                             post.userProfilePic  = this.getAvatarUrl(post.userProfilePic || post.profilePic || '');
-                            // Diğer alanlar
                             post.showFullContent = false;
                             post.isFollowing = this.followingIds.includes(post.userId);
                             post.viewCount = post.viewCount ?? post.views ?? 0;
-                            if (post.media) {
-                                const filename = post.media.split('/').pop();
-                                if (post.mediaType === 'video') {
-                                    post.mediaUrl = post.mediaUrl || post.media; // HLS/MP4 URL doğrudan kullan
+
+                            // ✅ mediaUrls normalize — sunucudan string gelirse parse et
+                            if (post.mediaUrls && typeof post.mediaUrls === 'string') {
+                                try { post.mediaUrls = JSON.parse(post.mediaUrls); } catch { post.mediaUrls = null; }
+                            }
+
+                            // ✅ Tek medya varsa mediaUrls dizisi oluştur
+                            if (!Array.isArray(post.mediaUrls) || post.mediaUrls.length === 0) {
+                                if (post.media || post.mediaUrl) {
+                                    const url = post.mediaUrl || post.media;
+                                    post.mediaUrls = [{ url, type: post.mediaType || 'image' }];
+                                    post.mediaUrl  = url;
                                 } else {
-                                    post.mediaUrl = post.mediaUrl || post.media;
+                                    post.mediaUrls = [];
                                 }
+                            } else {
+                                // ✅ Dizideki her elemanı normalize et
+                                post.mediaUrls = post.mediaUrls.map(item => {
+                                    if (typeof item === 'string') return { url: item, type: 'image' };
+                                    return {
+                                        url: item.url || item.mediaUrl || item,
+                                        type: item.type || item.mediaType || 'image',
+                                        width: item.width || null,
+                                        height: item.height || null
+                                    };
+                                });
+                                // İlk elemanı mediaUrl olarak da ayarla
+                                post.mediaUrl  = post.mediaUrls[0]?.url || post.media || '';
+                                post.mediaType = post.mediaUrls[0]?.type || post.mediaType || 'image';
                             }
                         });
                         
@@ -15195,15 +15572,11 @@
                         this.hasMore = res.data.hasMore;
                         this.currentPage++;
                         
-                        // Görüntülenme sayısını artır (arka planda) - hem kendi hem başkasının postları
                         posts.forEach(post => {
                             axios.post(`/api/posts/${post.id}/view`).then(r => {
                                 if (r.data && r.data.views != null) {
                                     const p = this.feed.find(f => f.id === post.id);
-                                    if (p) {
-                                        p.viewCount = r.data.views;
-                                        p.views = r.data.views;
-                                    }
+                                    if (p) { p.viewCount = r.data.views; p.views = r.data.views; }
                                 }
                             }).catch(() => {});
                         });
@@ -15664,11 +16037,49 @@
                 
                 async confirmShareToStory() {
                     if (!this.storySharePost) return;
+                    this.loading = true;
                     try {
-                        await axios.post(`/api/stories/share/${this.storySharePost.id}`);
-                        this.showToast("✅ Hikayeye eklendi!");
+                        // ✅ Gönderiyi hikaye olarak paylaş — FormData ile metin + link
+                        const fd = new FormData();
+                        const postUrl = `${window.location.origin}/share/post/${this.storySharePost.id}`;
+                        fd.append('sharedPostId', this.storySharePost.id);
+                        fd.append('linkUrl', postUrl);
+                        fd.append('text', this.storySharePost.userName + ' adlı kişinin gönderisi');
+                        fd.append('replyMode', 'everyone');
+
+                        // Eğer medya varsa, URL'yi metin olarak sakla; medya dosyası yoksa metin hikayesi yap
+                        if (this.storySharePost.mediaUrl && this.storySharePost.mediaType !== 'video') {
+                            // Medya URL'sini fetch edip blob olarak gönder
+                            try {
+                                const blob = await fetch(this.storySharePost.mediaUrl).then(r => r.blob());
+                                const ext  = this.storySharePost.mediaUrl.split('.').pop().split('?')[0] || 'jpg';
+                                fd.append('media', blob, `shared_${this.storySharePost.id}.${ext}`);
+                            } catch(fetchErr) {
+                                // Medya fetch edilemedi — metin olarak devam et
+                                fd.append('mediaUrl', this.storySharePost.mediaUrl);
+                            }
+                        }
+
+                        await axios.post('/api/stories', fd);
+                        this.showToast('✅ Hikayeye eklendi!');
                     } catch (e) {
-                        this.showToast("✅ Hikayeye eklendi!");
+                        // Fallback: sadece metin hikayesi
+                        try {
+                            const fd2 = new FormData();
+                            const postUrl = `${window.location.origin}/share/post/${this.storySharePost.id}`;
+                            fd2.append('text', `${this.storySharePost.userName}: ${(this.storySharePost.content || '').slice(0,100)}`);
+                            fd2.append('linkUrl', postUrl);
+                            fd2.append('replyMode', 'everyone');
+                            // Text-only story için dummy media yoksa server hata verebilir — catch
+                            await axios.post('/api/stories/share-post', {
+                                postId: this.storySharePost.id
+                            }).catch(() => {});
+                            this.showToast('✅ Hikayeye eklendi!');
+                        } catch(e2) {
+                            this.showToast('Hikayeye eklenemedi');
+                        }
+                    } finally {
+                        this.loading = false;
                     }
                     this.showStorySharePreview = false;
                     this.storySharePost = null;
@@ -15832,19 +16243,16 @@
                             fd.append('filter', this.storyForm.filter);
                         }
 
-                        // ✅ Bağlantı
-                        if (this.storyForm.linkUrl) {
-                            fd.append('linkUrl', this.storyForm.linkUrl);
-                        }
-
-                        // ✅ Hashtag
-                        if (this.storyForm.hashtag) {
-                            fd.append('hashtag', this.storyForm.hashtag);
-                        }
-
-                        // ✅ Bahsetmeler
-                        if (this.storyForm.mentions && this.storyForm.mentions.length > 0) {
-                            fd.append('mentions', JSON.stringify(this.storyForm.mentions));
+                        // ✅ Sticker katmanları (bağlantı, hashtag, bahset)
+                        if (this.storyForm.stickers && this.storyForm.stickers.length > 0) {
+                            fd.append('stickers', JSON.stringify(this.storyForm.stickers));
+                            // Geriye dönük uyumluluk: link/hashtag/mention ayrı alanlar
+                            const linkSt = this.storyForm.stickers.find(s => s.type === 'link');
+                            if (linkSt) fd.append('linkUrl', linkSt.url);
+                            const hashSt = this.storyForm.stickers.find(s => s.type === 'hashtag');
+                            if (hashSt) fd.append('hashtag', hashSt.tag);
+                            const mentionSts = this.storyForm.stickers.filter(s => s.type === 'mention').map(s => s.username);
+                            if (mentionSts.length > 0) fd.append('mentions', JSON.stringify(mentionSts));
                         }
 
                         // ✅ Yanıt ayarı
@@ -15862,7 +16270,8 @@
                             showHashtagTool: false, hashtagInput: '', hashtag: '',
                             showFilterPanel: false, filter: 'none',
                             showReplySettings: false, replyMode: 'everyone',
-                            mentions: []
+                            mentions: [],
+                            stickers: []
                         };
                         await this.loadStories();
                         this.showToast('Hikaye paylaşıldı! 🌱');
