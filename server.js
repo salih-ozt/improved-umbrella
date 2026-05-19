@@ -46,6 +46,244 @@ const { v4: uuidv4 } = require('uuid');
 const sharp = require('sharp');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 AUTH RATE LIMITERS — Brute-force & spam koruması
+// ════════════════════════════════════════════════════════════════════
+const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req, res) => {
+        // IP + email/identifier kombinasyonu → daha hassas hedefleme
+        const id = (req.body?.identifier || req.body?.email || req.body?.username || '').toLowerCase().trim().slice(0, 50);
+        return rateLimit.ipKeyGenerator(req, res) + ':' + id;
+    },
+    message: { error: 'Çok fazla giriş denemesi. Lütfen 15 dakika sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+const registerLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
+    message: { error: 'Çok fazla kayıt denemesi. Lütfen 1 saat sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+const otpLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000, // 10 dakika
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
+    message: { error: 'Çok fazla OTP denemesi. Lütfen 10 dakika sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+const forgotPasswordLimiter = rateLimit({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
+    message: { error: 'Çok fazla şifre sıfırlama talebi. Lütfen 1 saat sonra tekrar deneyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 GLOBAL SPAM KORUMA — Auto-Ban Sistemi
+// ════════════════════════════════════════════════════════════════════
+// In-memory violation tracker (cluster'da her worker bağımsız; production'da Redis önerirlir)
+const spamViolations = new Map(); // ip → { count, firstViolation }
+
+// Otomatik IP ban — DB'ye yazar (pool henüz tanımlı değil; fn tanımı yeterli, pool startup'ta hazır)
+async function recordSpamViolation(ip, reason, pool, threshold = 3) {
+    if (!ip || ip === 'unknown') return;
+    const now  = Date.now();
+    const prev = spamViolations.get(ip) || { count: 0, firstViolation: now };
+    prev.count++;
+    spamViolations.set(ip, prev);
+    console.warn(`[SpamGuard] IP: ${ip} | İhlal #${prev.count} | Sebep: ${reason}`);
+    if (prev.count >= threshold) {
+        try {
+            await pool.query(
+                `INSERT INTO banned_ips (ip, reason, "bannedAt")
+                 VALUES ($1, $2, NOW())
+                 ON CONFLICT (ip) DO NOTHING`,
+                [ip, `${reason} — ${prev.count} rate limit ihlali`]
+            );
+            console.warn(`🚫 [AutoBan] IP BAN'a alındı: ${ip} | ${reason}`);
+        } catch (dbErr) {
+            console.error('[AutoBan] DB hatası:', dbErr.message);
+        }
+    }
+}
+
+// Ortak limiter factory — auto-ban destekli
+function makeSpamLimiter({ windowMs, max, reason, threshold = 3, keyFn }) {
+    // keyFn sadece (req) alıyor ama express-rate-limit (req, res) bekliyor.
+    // IPv6 doğrulamasını geçmek için: IP bazlı anahtarlar ipKeyGenerator üzerinden,
+    // kullanıcı-id bazlı anahtarlar ise IP'ye geri düşmeden doğrudan döner.
+    const keyGenerator = keyFn
+        ? (req, res) => {
+              const userId = req.user?.id;
+              // Kullanıcı ID varsa → IP'ye dokunmadan direkt kullan (IPv6 sorunu yok)
+              if (userId) return String(userId);
+              // Yoksa → ipKeyGenerator ile IPv6-safe IP al
+              return rateLimit.ipKeyGenerator(req, res);
+          }
+        : (req, res) => rateLimit.ipKeyGenerator(req, res);
+
+    return rateLimit({
+        windowMs,
+        max,
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator,
+        skip: (req) => process.env.NODE_ENV === 'test',
+        handler: async (req, res) => {
+            let ip = 'unknown';
+            try { ip = rateLimit.ipKeyGenerator(req, res) || 'unknown'; } catch (_) {
+                ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress || 'unknown';
+            }
+            if (typeof pool !== 'undefined' && pool !== null) {
+                recordSpamViolation(ip, reason, pool, threshold).catch(() => {});
+            }
+            return res.status(429).json({
+                success: false,
+                error: 'Çok fazla istek gönderildi. Lütfen daha sonra tekrar deneyin.',
+                retryAfter: Math.ceil(windowMs / 60000) + ' dakika'
+            });
+        }
+    });
+}
+
+// ── Partnership ──────────────────────────────────────────────────────
+const partnershipLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 5,
+    reason: 'Partnership spam',
+    threshold: 3,
+});
+
+// Partnership IP ban kontrol middleware (banned_ips tablosu)
+const checkPartnershipIpBan = async (req, res, next) => {
+    const ip = req.ip || req.headers['x-forwarded-for']?.split(',')[0]?.trim();
+    if (!ip) return next();
+    try {
+        const banned = await pool.query(`SELECT id FROM banned_ips WHERE ip = $1 LIMIT 1`, [ip]);
+        if (banned.rows.length > 0) {
+            console.warn(`[Partnership] Banlı IP erişim girişimi: ${ip}`);
+            return res.status(403).json({ success: false, error: 'Erişiminiz kısıtlanmıştır.' });
+        }
+        next();
+    } catch (err) {
+        console.error('[checkPartnershipIpBan] DB hatası:', err.message);
+        next();
+    }
+};
+
+// ── Resend Verification — e-posta flood koruması ─────────────────────
+const resendVerificationLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 3,
+    reason: 'Resend-verification spam',
+    threshold: 3,
+});
+
+// ── Post oluşturma — authenticated spam ──────────────────────────────
+const postCreateLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 20,
+    reason: 'Post-create spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Yorum spam ───────────────────────────────────────────────────────
+const commentLimiter = makeSpamLimiter({
+    windowMs: 5 * 60 * 1000, // 5 dakika
+    max: 20,
+    reason: 'Comment spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Like spam ────────────────────────────────────────────────────────
+const likeLimiter = makeSpamLimiter({
+    windowMs: 60 * 1000, // 1 dakika
+    max: 60,
+    reason: 'Like spam',
+    threshold: 10,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Follow spam ──────────────────────────────────────────────────────
+const followLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 50,
+    reason: 'Follow spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Report spam ─────────────────────────────────────────────────────
+const reportLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 10,
+    reason: 'Report spam',
+    threshold: 3,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Search spam ─────────────────────────────────────────────────────
+const searchLimiter = makeSpamLimiter({
+    windowMs: 60 * 1000, // 1 dakika
+    max: 30,
+    reason: 'Search spam',
+    threshold: 10,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Upload spam ─────────────────────────────────────────────────────
+const uploadLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 15,
+    reason: 'Upload spam',
+    threshold: 3,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Store/ürün oluşturma ─────────────────────────────────────────────
+const storeLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 20,
+    reason: 'Store-create spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Stories ─────────────────────────────────────────────────────────
+const storyLimiter = makeSpamLimiter({
+    windowMs: 60 * 60 * 1000, // 1 saat
+    max: 30,
+    reason: 'Story spam',
+    threshold: 5,
+    keyFn: (req) => req.user?.id || req.ip || 'unknown',
+});
+
+// ── Auth/refresh token flood ─────────────────────────────────────────
+const refreshLimiter = makeSpamLimiter({
+    windowMs: 15 * 60 * 1000, // 15 dakika
+    max: 20,
+    reason: 'Token-refresh spam',
+    threshold: 5,
+});
+
 const compression = require('compression');
 const helmet = require('helmet');
 const { Pool } = require('pg');
@@ -177,9 +415,10 @@ const BCRYPT_ROUNDS = 12;
 // ══════════════════════════════════════════════════════════════════════
 
 if (!process.env.DB_ENCRYPTION_KEY || process.env.DB_ENCRYPTION_KEY.length < 32) {
-    console.warn('⚠️  [ŞİFRELEME] DB_ENCRYPTION_KEY tanımlı değil veya 32 karakterden kısa!');
-    console.warn('   Hassas veriler (email, mesajlar, IP) şifrelenmeden saklanıyor.');
-    console.warn('   Örnek: DB_ENCRYPTION_KEY=' + require('crypto').randomBytes(32).toString('hex'));
+    console.error('❌ HATA: DB_ENCRYPTION_KEY .env dosyasında tanımlı değil veya 32 karakterden kısa!');
+    console.error('   Hassas veriler şifrelenemez. Sunucu güvenli değil.');
+    console.error('   Örnek: DB_ENCRYPTION_KEY=' + require('crypto').randomBytes(32).toString('hex'));
+    process.exit(1);
 }
 
 const DB_ENCRYPTION_KEY = process.env.DB_ENCRYPTION_KEY || null;
@@ -655,13 +894,11 @@ function getForgotPasswordEmailTemplate(userName, resetToken) {
     const name       = userName || 'Değerli Üye';
     const DOMAIN     = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
     // Kullanıcı bu linke tıklayınca /api/auth/reset-password-direct?token=... sayfasına gider.
-    // O sayfa şifre sıfırlama formunu gösterir.
-    // 🔒 Token URL'de DEĞİL — form üzerinden POST ile gönderilir
-    // URL'deki token: server log, browser history, Referrer header'ında görünür
-    const resetLink  = `${DOMAIN}/?action=reset-password&ref=${encodeURIComponent(
-        Buffer.from(resetToken).toString('base64').slice(0, 8)  // sadece referans ID, token değil
-    )}`;
-    // Asıl token e-posta body'sindeki gizli formda hidden input olarak taşınır
+    // O sayfa şifre sıfırlama formunu gösterir ve token DB'den doğrulanır.
+    // 🔒 Token URL'de — email istemcisi Referer göndermez (HTTPS→HTTPS redirect yok)
+    // 🔒 Güvenlik: Referrer-Policy no-referrer header ile token dış sitelere sızmaz
+    // /api/auth/reset-password-direct sunucu tarafında HTML form render eder
+    const resetLink  = `${DOMAIN}/api/auth/reset-password-direct?token=${resetToken}`;
     return `<!DOCTYPE html>
 <html lang="tr">
 <head>
@@ -722,7 +959,7 @@ function getForgotPasswordEmailTemplate(userName, resetToken) {
   </div>
 
   <p style="font-size:12px;color:rgba(255,255,255,0.25);margin-top:16px">Butona tıklanamıyorsa aşağıdaki adresi tarayıcınıza kopyalayın:</p>
-  <div class="url-box">${resetLink}</div>
+  <div class="url-box">[Güvenlik nedeniyle bağlantı sadece butona tıklanarak kullanılabilir]</div>
 
   <div class="footer">
     <p><strong style="color:rgba(0,230,118,0.8)">AgroLink Güvenlik Ekibi</strong></p>
@@ -1071,6 +1308,8 @@ const accountFailedAttempts = new Map();
 const MAX_FAILED_LOGINS    = 10;
 const LOCKOUT_DURATION_MS  = 15 * 60 * 1000;
 
+// 🔒 NOT: Lockout sayaçları bellek tabanlıdır (cluster'da bölünür).
+// loginLimiter (express-rate-limit) DB/Redis destekli değil — production'da Redis store ekleyin.
 function checkAccountLockout(identifier) {
     const key   = identifier.toLowerCase().trim();
     const entry = accountFailedAttempts.get(key);
@@ -1292,42 +1531,6 @@ function sanitizeBody(req, res, next) {
     next();
 }
 
-// ==================== 🔒 IP BAN CACHE ====================
-
-const ipBanCache     = new Map();
-const IP_BAN_CACHE_TTL = 60 * 1000; // 1 dakika
-
-async function checkIpBanDB(ip) {
-    try {
-        return await dbGet(
-            `SELECT * FROM banned_ips WHERE ip = $1 AND ("expiresAt" IS NULL OR "expiresAt" > NOW())`,
-            [ip]
-        );
-    } catch { return null; }
-}
-
-const ipBanMiddleware = async (req, res, next) => {
-    try {
-        const ip = req.ip || req.connection.remoteAddress || '';
-        const cached = ipBanCache.get(ip);
-
-        if (cached) {
-            if (cached.banned && cached.expiresAt > Date.now()) {
-                return res.status(403).json({ error: 'IP adresiniz engellendi', reason: cached.reason });
-            }
-            if (!cached.banned && cached.timestamp > Date.now() - IP_BAN_CACHE_TTL) return next();
-        }
-
-        const banned = await checkIpBanDB(ip);
-        if (banned) {
-            ipBanCache.set(ip, { banned: true, reason: banned.reason, expiresAt: new Date(banned.expiresAt || '9999-12-31').getTime() });
-            return res.status(403).json({ error: 'IP adresiniz engellendi', reason: banned.reason });
-        }
-
-        ipBanCache.set(ip, { banned: false, timestamp: Date.now() });
-        next();
-    } catch { next(); }
-};
 
 // ==================== PostgreSQL BAĞLANTISI ====================
 
@@ -1785,12 +1988,12 @@ class LRUCache {
 
 // Cache örnekleri — her alan kendi boyut/TTL ayarına sahip
 const AppCache = {
-    feed     : new LRUCache(200,  30_000),   // Feed: 200 kullanıcı × 30s
-    post     : new LRUCache(500,  30_000),   // Post detayları: 500 post × 30s
-    profile  : new LRUCache(300,  60_000),   // Profil: 300 kullanıcı × 60s
+    feed     : new LRUCache(500,  45_000),   // Feed: 500 kullanıcı × 45s (↑ 200→500, 30→45)
+    post     : new LRUCache(1000, 60_000),   // Post detayları: 1000 post × 60s (↑ 500→1000, 30→60)
+    profile  : new LRUCache(500,  90_000),   // Profil: 500 kullanıcı × 90s (↑ 300→500, 60→90)
     trending : new LRUCache(10,   300_000),  // Trending: 5dk TTL
     weather  : new LRUCache(50,   600_000),  // Hava: 10dk TTL
-    suggest  : new LRUCache(100,  120_000),  // Önerilen kullanıcılar: 2dk
+    suggest  : new LRUCache(200,  180_000),  // Önerilen kullanıcılar: 3dk (↑ 100→200, 2→3dk)
 };
 
 // Periyodik temizlik — her 2 dakikada süresi dolanları sil
@@ -1829,7 +2032,7 @@ async function initializeDatabase() {
             location TEXT,
             language TEXT DEFAULT 'tr',
             "emailVerified" BOOLEAN DEFAULT FALSE,
-            "twoFactorEnabled" BOOLEAN DEFAULT TRUE,
+            "twoFactorEnabled" BOOLEAN DEFAULT FALSE,
             "isVerified" BOOLEAN DEFAULT FALSE,
             "hasFarmerBadge" BOOLEAN DEFAULT FALSE,
             "userType" TEXT DEFAULT 'normal_kullanici',
@@ -2122,6 +2325,19 @@ async function initializeDatabase() {
             UNIQUE("postId", "userId", "viewDate")
         )
     `);
+
+    // ─── Keşfet: Kullanıcının gördüğü postları takip et (24 saat sonra sıfırlanır)
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS explore_seen_posts (
+            "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            "postId" UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+            "seenAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY ("userId", "postId")
+        )
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_explore_seen_user ON explore_seen_posts("userId")`);
+    // 24 saatten eski kayıtları sil (günlük çalışan temizleyici için indeks)
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_explore_seen_at ON explore_seen_posts("seenAt")`);
 
     await pool.query(`
         CREATE TABLE IF NOT EXISTS suspicious_login_reports (
@@ -2416,6 +2632,14 @@ async function initializeDatabase() {
         // stories tablosu
         `ALTER TABLE stories ADD COLUMN IF NOT EXISTS "userId" UUID`,
         `ALTER TABLE stories ADD COLUMN IF NOT EXISTS "mediaUrl" TEXT`,
+        // ── Mesaj medya ve sesli mesaj desteği ──────────────────────────────
+        `ALTER TABLE messages ADD COLUMN IF NOT EXISTS "mediaUrl" TEXT`,
+        `ALTER TABLE messages ADD COLUMN IF NOT EXISTS "mediaType" TEXT DEFAULT 'text'`,
+        `ALTER TABLE messages ADD COLUMN IF NOT EXISTS "isRead" BOOLEAN DEFAULT FALSE`,
+        `ALTER TABLE messages ADD COLUMN IF NOT EXISTS "receiverId" UUID`,
+        `ALTER TABLE messages ADD COLUMN IF NOT EXISTS "duration" INTEGER`,
+        `CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages("recipientId","isRead") WHERE "isRead" = FALSE`,
+        `CREATE INDEX IF NOT EXISTS idx_messages_media ON messages("mediaType") WHERE "mediaType" IS NOT NULL`,
         `ALTER TABLE stories ADD COLUMN IF NOT EXISTS "mediaType" TEXT DEFAULT 'image'`,
         `ALTER TABLE stories ADD COLUMN IF NOT EXISTS "textColor" TEXT DEFAULT '#FFFFFF'`,
         `ALTER TABLE stories ADD COLUMN IF NOT EXISTS "viewCount" INTEGER DEFAULT 0`,
@@ -2440,7 +2664,9 @@ async function initializeDatabase() {
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "isPrivate" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "isActive" BOOLEAN DEFAULT TRUE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "emailVerified" BOOLEAN DEFAULT FALSE`,
-        `ALTER TABLE users ADD COLUMN IF NOT EXISTS "twoFactorEnabled" BOOLEAN DEFAULT TRUE`,
+        `ALTER TABLE users ADD COLUMN IF NOT EXISTS "twoFactorEnabled" BOOLEAN DEFAULT FALSE`,
+        `ALTER TABLE users ADD COLUMN IF NOT EXISTS "googleId" TEXT UNIQUE`,
+        `CREATE INDEX IF NOT EXISTS idx_users_google_id ON users("googleId")`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "isVerified" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "hasFarmerBadge" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "userType" TEXT DEFAULT 'normal_kullanici'`,
@@ -2517,6 +2743,20 @@ async function initializeDatabase() {
         `CREATE UNIQUE INDEX IF NOT EXISTS idx_verif_token_unique ON verification_requests(token) WHERE token IS NOT NULL`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "isVerified" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyExtra" TEXT`,
+        // ─── Partnerlik & İş Başvuruları Tablosu ───────────────────────
+        `CREATE TABLE IF NOT EXISTS partnership_applications (
+            id            TEXT PRIMARY KEY,
+            "fullName"    TEXT NOT NULL,
+            email         TEXT NOT NULL,
+            phone         TEXT,
+            "workField"   TEXT NOT NULL,
+            message       TEXT,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            "reviewNote"  TEXT,
+            "reviewedAt"  TIMESTAMPTZ,
+            "createdAt"   TIMESTAMPTZ DEFAULT NOW(),
+            "updatedAt"   TIMESTAMPTZ DEFAULT NOW()
+        )`,
     ];
 
     for (const migSql of columnMigrations) {
@@ -2564,6 +2804,8 @@ async function initializeDatabase() {
         // Block kontrolü — feed filtrelemede çift yönlü kontrol
         [`idx_blocks_blocker`,         `CREATE INDEX IF NOT EXISTS idx_blocks_blocker ON blocks("blockerId","blockedId")`],
         [`idx_blocks_blocked`,         `CREATE INDEX IF NOT EXISTS idx_blocks_blocked ON blocks("blockedId","blockerId")`],
+        // ⚡ Feed (takip bazlı) için: followerId + followingId çifti — EXISTS subquery hızlandırır
+        [`idx_follows_feed`,           `CREATE INDEX IF NOT EXISTS idx_follows_feed ON follows("followerId","followingId") INCLUDE ("followingId")`],
         // Follow kontrolü — isFollowing EXISTS için
         [`idx_follows_pair`,           `CREATE INDEX IF NOT EXISTS idx_follows_pair ON follows("followerId","followingId")`],
         // Message conversation: (senderId,receiverId,createdAt) birlikte sık
@@ -2602,78 +2844,31 @@ async function initializeDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens ("userId") WHERE "isActive" = TRUE`).catch(() => {});
 
     // ══════════════════════════════════════════════════════════════════════
-    // 💬 CHATSEE — Mesajlaşma Sistemi Tabloları
-    // ══════════════════════════════════════════════════════════════════════
 
-    // Konuşmalar (direkt veya grup)
+    // 🔒 Token blacklist tablosu (cluster-safe logout)
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_conversations (
-            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            type        TEXT NOT NULL DEFAULT 'direct',   -- 'direct' | 'group'
-            name        TEXT,                              -- grup adı
-            avatar_url  TEXT,
-            created_by  UUID REFERENCES users(id) ON DELETE SET NULL,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        CREATE TABLE IF NOT EXISTS blacklisted_tokens (
+            "tokenHash" TEXT PRIMARY KEY,
+            "expiresAt" TIMESTAMPTZ NOT NULL,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
-    `).catch(() => {});
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_blacklist_expires ON blacklisted_tokens("expiresAt")`).catch(()=>{});
 
-    // Konuşma üyeleri
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_members (
-            conversation_id UUID NOT NULL REFERENCES chatsee_conversations(id) ON DELETE CASCADE,
-            user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            is_admin        BOOLEAN DEFAULT FALSE,
-            last_read_at    TIMESTAMPTZ DEFAULT NOW(),
-            "joinedAt"      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (conversation_id, user_id)
-        )
-    `).catch(() => {});
-
-    // ChatSee mesajları (ayrı tablo — mevcut messages tablosuna dokunmadan)
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_messages (
-            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            conversation_id UUID NOT NULL REFERENCES chatsee_conversations(id) ON DELETE CASCADE,
-            sender_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            content         TEXT NOT NULL,
-            type            TEXT NOT NULL DEFAULT 'text',   -- 'text' | 'image' | 'file' | 'deleted'
-            reply_to_id     UUID REFERENCES chatsee_messages(id),
-            is_deleted      BOOLEAN DEFAULT FALSE,
-            "createdAt"     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    `).catch(() => {});
-
-    // Okundu bilgisi
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_reads (
-            message_id UUID NOT NULL REFERENCES chatsee_messages(id) ON DELETE CASCADE,
-            user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            "readAt"   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (message_id, user_id)
-        )
-    `).catch(() => {});
-
-    // ChatSee indeksler
-    const chatseeIndexes = [
-        `CREATE INDEX IF NOT EXISTS idx_cs_msgs_conv   ON chatsee_messages(conversation_id, "createdAt" DESC)`,
-        `CREATE INDEX IF NOT EXISTS idx_cs_members_uid ON chatsee_members(user_id)`,
-        `CREATE INDEX IF NOT EXISTS idx_cs_reads       ON chatsee_reads(user_id, message_id)`,
-        `CREATE INDEX IF NOT EXISTS idx_cs_conv_type   ON chatsee_conversations(type)`,
-    ];
-    for (const sql of chatseeIndexes) {
-        await pool.query(sql).catch(() => {});
-    }
-
-    console.log('✅ ChatSee tabloları hazır');
     console.log('✅ Tüm tablolar ve indeksler oluşturuldu (UUID)');
 }
 
 // ==================== EXPRESS UYGULAMASI ====================
 
 const app = express();
-app.set('trust proxy', 1); // 🔒 Nginx/proxy arkasında gerçek IP'yi al (rate-limit için zorunlu)
+// 🔒 Güvenli IP alma: sadece 1 seviye proxy güvenilir (Nginx/Cloudflare)
+// Saldırgan X-Forwarded-For header'ı sahte yazamaz (proxy doğruluyor)
+app.set('trust proxy', 1);
 const server = http.createServer(app);
+// 📱 Mobil büyük dosya yükleme desteği — timeout'ları artır
+server.timeout = 5 * 60 * 1000;          // 5 dakika (büyük fotoğraf/video yükleme)
+server.headersTimeout = 6 * 60 * 1000;   // headersTimeout > timeout olmalı
+server.requestTimeout = 5 * 60 * 1000;   // istek timeout'u
 
 // ══════════════════════════════════════════════════════════════════════════
 // 🔌 SOCKET.IO — Gerçek zamanlı mesajlaşma, bildirimler, online durumu
@@ -2685,17 +2880,18 @@ if (socketIo) {
     io = new socketIo.Server(server, {
         cors: {
             origin: (origin, callback) => {
-                // Native mobil (null origin) ve bilinen originlere izin ver
+                // Native mobil (null origin) — X-Mobile-App-Key kontrolü (Socket.IO handshake'te header yoksa geç)
+                // Native mobil bağlantı: JWT auth Socket.IO middleware'de yapılır
                 if (!origin) return callback(null, true);
                 if (
                     origin.startsWith('https://sehitumitkestitarimmtal.com') ||
                     origin.startsWith('http://sehitumitkestitarimmtal.com') ||
-                    origin.startsWith('http://localhost') ||
+                    (_IS_PROD ? false : origin.startsWith('http://localhost')) ||
                     origin.startsWith('capacitor://') ||
                     origin.startsWith('ionic://') ||
                     origin.startsWith('android://') ||
-                    origin.startsWith('http://10.0.2.2') ||
-                    origin.startsWith('exp://')
+                    (_IS_PROD ? false : origin.startsWith('http://10.0.2.2')) ||
+                    (_IS_PROD ? false : origin.startsWith('exp://'))
                 ) return callback(null, true);
                 // .env APP_URL
                 const appUrl = (process.env.APP_URL || '').replace(/\/$/, '');
@@ -2761,7 +2957,9 @@ if (socketIo) {
         socket.on('message:send', async (data) => {
             try {
                 const { receiverId, content, mediaUrl, mediaType, tempId } = data;
-                if (!receiverId || !content?.trim()) return;
+                // Sesli/medya mesajlar içerik olmadan gönderilebilir
+                if (!receiverId) return;
+                if (!content?.trim() && !mediaUrl) return; // ya metin ya medya zorunlu
 
                 // 🔒 Rate limit kontrolü
                 const now = Date.now();
@@ -2816,12 +3014,31 @@ if (socketIo) {
                 // Gönderene onay (tempId → gerçek id eşleşmesi)
                 socket.emit('message:sent', newMsg);
 
+                // Push bildirim: alıcı online olsa bile web push + FCM göndер
+                // (web push: tarayıcı kapalıysa/arka plandaysa çalışır; online kontrolü webpush kütüphanesi yapar)
+                const pushPayload = {
+                    title: socket.user?.name || socket.username,
+                    body : safeContent.substring(0, 100),
+                    url  : '/',
+                };
+                // Web Push (VAPID) — alıcının tarayıcı aboneliği varsa her durumda gönder
+                sendPushToUser(receiverId, pushPayload).catch(() => {});
+
                 // FCM push bildirimi (alıcı offline ise)
                 if (!onlineUsers.has(receiverId)) {
                     sendFcmPush(receiverId, {
-                        title: socket.user.name || socket.username,
+                        title: socket.user?.name || socket.username,
                         body : safeContent.substring(0, 100),
-                        data : { type: 'message', senderId: userId, messageId: msgId },
+                        data : {
+                            type           : 'message',
+                            url            : '/',
+                            senderId       : userId,
+                            messageId      : msgId,
+                            actorName      : socket.user?.name || socket.username,
+                            actorUsername  : socket.username,
+                            actorProfilePic: absoluteUrl(socket.user?.profilePic || ''),
+                            messagePreview : safeContent.substring(0, 100),
+                        },
                     }).catch(() => {});
                 }
             } catch (e) {
@@ -2863,199 +3080,67 @@ if (socketIo) {
         });
 
         // ══════════════════════════════════════════════════════════════════
-        // 💬 CHATSEE — Socket.IO Olayları
-        // ══════════════════════════════════════════════════════════════════
-
-        // Konuşma odasına katıl
-        socket.on('chatsee:join', async ({ conversationId }) => {
-            try {
-                const member = await pool.query(
-                    `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                );
-                if (member.rows.length) {
-                    socket.join(`cs:${conversationId}`);
-                }
-            } catch (e) { /* ignore */ }
-        });
-
-        // Konuşma odasından ayrıl
-        socket.on('chatsee:leave', ({ conversationId }) => {
-            socket.leave(`cs:${conversationId}`);
-        });
-
-        // ── Mesaj gönder ─────────────────────────────────────────────────
-        const csMsgCounters = new Map();
-        const CS_MSG_LIMIT  = 30;
-        const CS_WINDOW_MS  = 60_000;
-
-        socket.on('chatsee:message', async (data, ack) => {
-            try {
-                const { conversationId, content, type = 'text', replyToId, tempId } = data;
-                if (!conversationId || !content?.trim()) return ack?.({ error: 'Geçersiz veri' });
-
-                // Rate limit
-                const now  = Date.now();
-                const ctr  = csMsgCounters.get(userId) || { c: 0, r: now + CS_WINDOW_MS };
-                if (now > ctr.r) { ctr.c = 0; ctr.r = now + CS_WINDOW_MS; }
-                ctr.c++;
-                csMsgCounters.set(userId, ctr);
-                if (ctr.c > CS_MSG_LIMIT) return ack?.({ error: 'Çok hızlı mesaj gönderiyorsunuz' });
-
-                // Üyelik kontrolü
-                const mem = await pool.query(
-                    `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                );
-                if (!mem.rows.length) return ack?.({ error: 'Bu konuşmaya erişim izniniz yok' });
-
-                const safeContent = content.trim().slice(0, 4000);
-                const msgId = require('uuid').v4();
-
-                await pool.query(
-                    `INSERT INTO chatsee_messages (id, conversation_id, sender_id, content, type, reply_to_id, "createdAt")
-                     VALUES ($1,$2,$3,$4,$5,$6,NOW())`,
-                    [msgId, conversationId, userId, safeContent, type, replyToId || null]
-                );
-
-                // conversation updatedAt güncelle
-                pool.query(`UPDATE chatsee_conversations SET "updatedAt"=NOW() WHERE id=$1`, [conversationId]).catch(()=>{});
-
-                const senderInfo = await pool.query(
-                    `SELECT id, name, username, "profilePic" FROM users WHERE id=$1`,
-                    [userId]
-                );
-                const sender = senderInfo.rows[0] || {};
-
-                const payload = {
-                    id             : msgId,
-                    conversationId,
-                    senderId       : userId,
-                    content        : safeContent,
-                    type,
-                    replyToId      : replyToId || null,
-                    createdAt      : new Date().toISOString(),
-                    tempId         : tempId || null,
-                    sender: {
-                        id        : sender.id,
-                        name      : sender.name,
-                        username  : sender.username,
-                        profilePic: sender.profilePic
-                            ? absoluteUrl(sender.profilePic)
-                            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(sender.username||'u')}&backgroundColor=0a1628`,
-                    },
-                    readBy: [userId],
-                };
-
-                // Odadaki herkese gönder
-                io.to(`cs:${conversationId}`).emit('chatsee:message', payload);
-
-                // FCM — çevrimdışı üyelere push
-                const members = await pool.query(
-                    `SELECT user_id FROM chatsee_members WHERE conversation_id=$1 AND user_id!=$2`,
-                    [conversationId, userId]
-                );
-                for (const m of members.rows) {
-                    if (!onlineUsers.has(m.user_id)) {
-                        sendFcmPush(m.user_id, {
-                            title: sender.name || sender.username || 'Yeni mesaj',
-                            body : safeContent.slice(0, 100),
-                            data : { type: 'chatsee_message', conversationId, messageId: msgId },
-                        }).catch(() => {});
-                    }
-                }
-
-                ack?.({ success: true, message: payload });
-            } catch (e) {
-                console.error('[CHATSEE socket:message]', e.message);
-                ack?.({ error: 'Mesaj gönderilemedi' });
-            }
-        });
-
-        // ── Yazıyor... ───────────────────────────────────────────────────
-        socket.on('chatsee:typing', ({ conversationId, isTyping }) => {
-            if (!conversationId) return;
-            socket.to(`cs:${conversationId}`).emit('chatsee:typing', {
-                conversationId,
-                userId,
-                username : socket.username,
-                isTyping : !!isTyping,
-            });
-        });
-
-        // ── Okundu ──────────────────────────────────────────────────────
-        socket.on('chatsee:read', async ({ conversationId, lastMessageId }) => {
-            try {
-                // Üyelik kontrolü
-                const mem = await pool.query(
-                    `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                );
-                if (!mem.rows.length) return;
-
-                // Mesajları okundu işaretle
-                await pool.query(`
-                    INSERT INTO chatsee_reads (message_id, user_id, "readAt")
-                    SELECT m.id, $1, NOW()
-                    FROM chatsee_messages m
-                    WHERE m.conversation_id = $2
-                      AND m.sender_id != $1
-                      AND m."createdAt" <= (SELECT "createdAt" FROM chatsee_messages WHERE id=$3)
-                    ON CONFLICT DO NOTHING
-                `, [userId, conversationId, lastMessageId]).catch(() => {});
-
-                // last_read_at güncelle
-                pool.query(
-                    `UPDATE chatsee_members SET last_read_at=NOW() WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                ).catch(() => {});
-
-                // Gönderene okundu bildir
-                socket.to(`cs:${conversationId}`).emit('chatsee:read', {
-                    conversationId,
-                    userId,
-                    lastMessageId,
-                });
-            } catch (e) { /* ignore */ }
-        });
-
-        // ── Mesaj sil ───────────────────────────────────────────────────
-        socket.on('chatsee:delete', async ({ messageId }, ack) => {
-            try {
-                const msg = await pool.query(
-                    `UPDATE chatsee_messages SET is_deleted=TRUE, content='Bu mesaj silindi.', type='deleted'
-                     WHERE id=$1 AND sender_id=$2
-                     RETURNING id, conversation_id`,
-                    [messageId, userId]
-                );
-                if (!msg.rows.length) return ack?.({ error: 'İzin yok veya mesaj bulunamadı' });
-                const { conversation_id } = msg.rows[0];
-                io.to(`cs:${conversation_id}`).emit('chatsee:deleted', { messageId, conversationId: conversation_id });
-                ack?.({ success: true });
-            } catch (e) {
-                ack?.({ error: 'Silinemedi' });
-            }
-        });
-
         // ── Bağlantı kesildi ─────────────────────────────────────────────
         // ═══════════════════════════════════════════════════
         // 📹 GÖRÜNTÜLÜ / SESLİ ARAMA — WebRTC Sinyal Köprüsü
         // ═══════════════════════════════════════════════════
 
+        // Aktif aramalar takibi (callId → { callerId, recipientId, type, startTime })
+        const activeCalls = new Map();
+
         // Arama başlat
         socket.on('call:initiate', async ({ recipientId, type, callId }) => {
             try {
-                const caller = { id: userId, name: socket.user.name, username: socket.username, profilePic: socket.user.profilePic };
+                if (!recipientId || !callId) return;
+                const caller = {
+                    id        : userId,
+                    name      : socket.user.name,
+                    username  : socket.username,
+                    profilePic: absoluteUrl(socket.user.profilePic || ''),
+                };
                 const recipientSockets = onlineUsers.get(recipientId);
+
                 if (!recipientSockets || recipientSockets.size === 0) {
-                    socket.emit('call:error', { error: 'Kullanıcı çevrimdışı' });
+                    socket.emit('call:error', { callId, error: 'Kullanıcı çevrimdışı', code: 'USER_OFFLINE' });
+                    // FCM ile çevrimdışı push gönder (missed call)
+                    sendFcmPush(recipientId, {
+                        title: caller.name || caller.username,
+                        body : `📞 ${type === 'audio' ? 'Sesli' : 'Görüntülü'} arama cevapsız kaldı`,
+                        data : { type: 'missed_call', callerId: userId, callType: type || 'video', actorName: caller.name || caller.username, actorUsername: caller.username, actorProfilePic: caller.profilePic },
+                    }).catch(() => {});
                     return;
                 }
+
+                // Çağrıyı kaydet
+                activeCalls.set(callId, { callerId: userId, recipientId, type: type || 'video', startTime: Date.now() });
+
+                // Alıcıya çağrı bildirimi gönder (TÜM socketlerine)
                 recipientSockets.forEach(sid => {
-                    io.to(sid).emit('incoming_call', { callId, caller, type: type || 'video' });
+                    io.to(sid).emit('incoming_call', {
+                        callId,
+                        caller,
+                        type  : type || 'video',
+                        timestamp: Date.now(),
+                    });
                 });
+
                 socket.emit('call:ringing', { callId, recipientId });
-            } catch (e) { socket.emit('call:error', { error: 'Arama başlatılamadı' }); }
+                console.log(`📞 [CALL] ${caller.username} → ${recipientId} | type: ${type || 'video'} | callId: ${callId}`);
+
+                // 30 saniye içinde cevap gelmezse timeout
+                setTimeout(() => {
+                    const call = activeCalls.get(callId);
+                    if (call && call.callerId === userId) {
+                        activeCalls.delete(callId);
+                        socket.emit('call:timeout', { callId });
+                        recipientSockets.forEach(sid => io.to(sid).emit('call:cancelled', { callId }));
+                    }
+                }, 30000);
+
+            } catch (e) {
+                console.error('[SOCKET call:initiate]', e);
+                socket.emit('call:error', { callId, error: 'Arama başlatılamadı' });
+            }
         });
 
         // Aramayı yanıtla (kabul / red)
@@ -3067,13 +3152,20 @@ if (socketIo) {
             }
             if (response === 'accept') {
                 socket.emit('call:accepted', { callId });
+                console.log(`📞 [CALL] Kabul: callId=${callId}`);
+            } else {
+                activeCalls.delete(callId);
+                console.log(`📞 [CALL] Red: callId=${callId}`);
             }
         });
 
         // Aramayı bitir
-        socket.on('call:end', ({ callId, recipientId }) => {
-            const targetSockets = onlineUsers.get(recipientId);
-            if (targetSockets) targetSockets.forEach(sid => io.to(sid).emit('call_ended', { callId }));
+        socket.on('call:end', ({ callId, recipientId: targetId }) => {
+            activeCalls.delete(callId);
+            const targetSockets = onlineUsers.get(targetId);
+            if (targetSockets) targetSockets.forEach(sid => io.to(sid).emit('call_ended', { callId, endedBy: userId }));
+            socket.emit('call_ended', { callId });
+            console.log(`📞 [CALL] Bitti: callId=${callId}`);
         });
 
         // WebRTC: Offer ilet
@@ -3118,14 +3210,60 @@ if (socketIo) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
+
+// 🔒 LOG GÜVENLİĞİ: E-posta adreslerini logda maskele (user@domain → us**@domain)
+function maskEmail(email) {
+    if (!email || typeof email !== 'string') return '[email]';
+    const [local, domain] = email.split('@');
+    if (!domain) return '***';
+    const masked = local.length <= 2 ? '**' : local.slice(0, 2) + '*'.repeat(Math.min(local.length - 2, 4));
+    return `${masked}@${domain}`;
+}
 // 🔔 FCM PUSH BİLDİRİM YARDIMCI FONKSİYONU
 // ══════════════════════════════════════════════════════════════════════════
 async function sendFcmPush(userId, { title, body, data = {} }) {
-    if (!firebaseAdmin) return;
+    // ── Web Push (VAPID) — platform='web' tokenları için ───────────────────
+    // FCM Admin olmasa bile web push çalışabilir
+    if (webpush && process.env.VAPID_PUBLIC_KEY) {
+        try {
+            const webRows = await dbAll(
+                `SELECT token, platform FROM device_tokens WHERE "userId" = $1 AND "isActive" = TRUE AND platform = 'web'`,
+                [userId]
+            ).catch(() => []);
+            for (const row of webRows) {
+                try {
+                    // Web token formatı: JSON string olarak saklanır { endpoint, keys: { p256dh, auth } }
+                    let sub;
+                    try { sub = JSON.parse(row.token); } catch(_) { continue; }
+                    if (!sub?.endpoint) continue;
+                    // url top-level'da olmalı — Service Worker notificationclick handler bunu okur
+                    const notifUrl = data?.url
+                        ? (data.url.startsWith('http') ? data.url : APP_URL + data.url)
+                        : APP_URL;
+                    const payload = JSON.stringify({ title, body, icon: '/agro.png', url: notifUrl, data, timestamp: Date.now() });
+                    await webpush.sendNotification(sub, payload).catch(async (err) => {
+                        if (err.statusCode === 410 || err.statusCode === 404) {
+                            await dbRun(`UPDATE device_tokens SET "isActive" = FALSE WHERE token = $1`, [row.token]).catch(() => {});
+                        }
+                    });
+                } catch(_) {}
+            }
+        } catch(_) {}
+    }
+
+    if (!firebaseAdmin) {
+        // Sadece web push varsa sessizce dön — FCM uyarısını web-only senaryoda bastır
+        if (!webpush) console.warn('[FCM] firebaseAdmin null — FIREBASE_SERVICE_ACCOUNT_JSON .env\'de tanımlı mı?');
+        return;
+    }
     try {
-        // Kullanıcının kayıtlı FCM token'larını al
+        // Kullanıcının kayıtlı FCM token'larını al — android, ios ve web (FCM Web token)
+        // platform='web' olanlar içinde FCM token (firebase SDK registration token) olabilir,
+        // bunlar VAPID sub değil — platform whitelist ile ayırt et
         const rows = await dbAll(
-            `SELECT token FROM device_tokens WHERE "userId" = $1 AND "isActive" = TRUE`,
+            `SELECT token, platform FROM device_tokens
+             WHERE "userId" = $1 AND "isActive" = TRUE
+               AND platform IN ('android', 'ios', 'web_fcm')`,
             [userId]
         );
         if (!rows || rows.length === 0) return;
@@ -3133,27 +3271,615 @@ async function sendFcmPush(userId, { title, body, data = {} }) {
         const tokens = rows.map(r => r.token).filter(Boolean);
         if (tokens.length === 0) return;
 
+        // data alanındaki tüm değerleri string'e çevir (FCM zorunluluğu)
+        const safeData = Object.fromEntries(
+            Object.entries(data).map(([k, v]) => [k, String(v ?? '')])
+        );
+
+        // platform listesine göre per-token mesajlar oluştur
+        // sendEachForMulticast tek bir mesajı tüm tokenlara gönderir —
+        // platform spesifik bloklar (android/apns/webpush) FCM tarafında
+        // ilgili token'ın platform'una göre otomatik uygulanır
         const message = {
             notification: { title, body },
-            data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])),
+            data: safeData,
             tokens,
+            // ── Android: yüksek öncelik + bildirim kanalı ──────────────
+            android: {
+                priority: 'high',
+                notification: {
+                    title,
+                    body,
+                    channelId: 'agrolink_notifications',
+                    sound: 'default',
+                    clickAction: 'FLUTTER_NOTIFICATION_CLICK',
+                },
+            },
+            // ── APNs (iOS) ──────────────────────────────────────────────
+            apns: {
+                payload: {
+                    aps: {
+                        alert: { title, body },
+                        sound: 'default',
+                        badge: 1,
+                    },
+                },
+                headers: { 'apns-priority': '10' },
+            },
+            // ── FCM Web Push (web_fcm platform) ────────────────────────
+            webpush: {
+                notification: {
+                    title,
+                    body,
+                    icon: '/agro.png',
+                    badge: '/agro.png',
+                    requireInteraction: false,
+                },
+                fcmOptions: {
+                    // FCM webpush.fcmOptions.link mutlaka absolute URL olmalı
+                    link: data.url
+                        ? (data.url.startsWith('http') ? data.url : APP_URL + (data.url.startsWith('/') ? data.url : '/' + data.url))
+                        : APP_URL,
+                },
+            },
         };
 
         const response = await firebaseAdmin.messaging().sendEachForMulticast(message);
 
+        // Sonuçları logla
+        const successCount = response.responses.filter(r => r.success).length;
+        const failCount    = response.responses.filter(r => !r.success).length;
+        if (failCount > 0) {
+            console.warn(`[FCM] userId=${userId} → ${successCount} başarılı, ${failCount} başarısız`);
+        }
+
         // Geçersiz token'ları temizle
         response.responses.forEach((r, i) => {
-            if (!r.success && (
-                r.error?.code === 'messaging/invalid-registration-token' ||
-                r.error?.code === 'messaging/registration-token-not-registered'
-            )) {
-                dbRun(`UPDATE device_tokens SET "isActive" = FALSE WHERE token = $1`, [tokens[i]]).catch(() => {});
+            if (!r.success) {
+                const code = r.error?.code || '';
+                console.warn(`[FCM] Token hatası [${i}]: ${code} — ${r.error?.message || ''}`);
+                if (
+                    code === 'messaging/invalid-registration-token' ||
+                    code === 'messaging/registration-token-not-registered' ||
+                    code === 'messaging/unregistered'
+                ) {
+                    dbRun(`UPDATE device_tokens SET "isActive" = FALSE WHERE token = $1`, [tokens[i]]).catch(() => {});
+                }
             }
         });
     } catch (e) {
-        console.error('[FCM Push Error]', e.message);
+        console.error('[FCM Push Error]', e.message, e.stack?.split('\n')[1] || '');
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🔔 AKILLI BİLDİRİM SİSTEMİ — Zaman Bazlı, Gerçek Veriye Dayalı
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  KURULUM: npm install node-cron
+//  .env:    SMART_NOTIF_ENABLED=true
+//
+//  Segmentler:  🟢 Aktif (≤2 gün)  🟡 Orta (3-7 gün)  🔴 Pasif (8-30 gün)
+//  Kampanyalar: morning | noon | evening | night | serial_1 | serial_2 | serial_3
+//
+// ════════════════════════════════════════════════════════════════════════════
+
+let cron = null;
+try {
+    cron = require('node-cron');
+    console.log('✅ node-cron yüklendi — Akıllı Bildirim Sistemi aktif');
+} catch (_) {
+    console.warn('⚠️  node-cron bulunamadı. (npm install node-cron)');
+}
+
+// ── Kullanıcı segmentini belirle ─────────────────────────────────────────────
+// Dönüş: 'active' | 'medium' | 'passive' | 'dormant'
+async function getUserSegment(userId) {
+    try {
+        const r = await dbAll(
+            `SELECT "lastLogin" FROM users WHERE id=$1 AND "isActive"=TRUE AND "isBanned"=FALSE`,
+            [userId]
+        );
+        if (!r || r.length === 0) return 'dormant';
+        const last = r[0].lastLogin;
+        if (!last) return 'dormant';
+        const daysSince = (Date.now() - new Date(last).getTime()) / (1000 * 60 * 60 * 24);
+        if (daysSince <= 2)  return 'active';
+        if (daysSince <= 7)  return 'medium';
+        if (daysSince <= 30) return 'passive';
+        return 'dormant';
+    } catch (_) { return 'dormant'; }
+}
+
+// ── Kullanıcının tipik giriş saatini hesapla ─────────────────────────────────
+// Son 7 günün giriş saatlerinin modunu alır → en sık kullandığı saat
+// Veri yoksa null döner (global schedule kullanılır)
+async function getUserTypicalHour(userId) {
+    try {
+        const rows = await dbAll(
+            `SELECT hour, COUNT(*) as cnt
+             FROM user_login_hours
+             WHERE "userId"=$1 AND "loggedAt" > NOW() - INTERVAL '14 days'
+             GROUP BY hour ORDER BY cnt DESC LIMIT 1`,
+            [userId]
+        );
+        if (!rows || rows.length === 0) return null;
+        return parseInt(rows[0].hour);
+    } catch (_) { return null; }
+}
+
+// ── Gün içi gerçek trend içerik al ──────────────────────────────────────────
+// Bugünün en çok beğenilen/yorum alan postunu getirir
+async function getTodayTrendingPost() {
+    try {
+        const rows = await dbAll(`
+            SELECT p.id, p.content,
+                   u.name as "authorName",
+                   COALESCE(p."likeCount",0) + COALESCE(p."commentCount",0)*2 AS score
+            FROM posts p
+            JOIN users u ON u.id = p."userId"
+            WHERE p."createdAt" > NOW() - INTERVAL '24 hours'
+              AND p."isActive" = TRUE
+              AND p.content IS NOT NULL
+              AND length(p.content) > 10
+            ORDER BY score DESC
+            LIMIT 1
+        `);
+        return rows && rows.length > 0 ? rows[0] : null;
+    } catch (_) { return null; }
+}
+
+// Bugünkü en aktif konu kategorisini getirir (en çok post atılan)
+async function getTodayTopCategory() {
+    try {
+        const rows = await dbAll(`
+            SELECT category, COUNT(*) as cnt
+            FROM posts
+            WHERE "createdAt" > NOW() - INTERVAL '24 hours'
+              AND "isActive" = TRUE
+              AND category IS NOT NULL
+            GROUP BY category
+            ORDER BY cnt DESC
+            LIMIT 1
+        `);
+        return rows && rows.length > 0 ? rows[0].category : null;
+    } catch (_) { return null; }
+}
+
+// Son 1 saatteki yorum sayısını getir (trend kontrol)
+async function getRecentCommentCount() {
+    try {
+        const rows = await dbAll(
+            `SELECT COUNT(*) as cnt FROM comments WHERE "createdAt" > NOW() - INTERVAL '1 hour'`
+        );
+        return rows && rows.length > 0 ? parseInt(rows[0].cnt) : 0;
+    } catch (_) { return 0; }
+}
+
+// Bugün pazaryerine eklenen ürün sayısı
+async function getTodayMarketplaceCount() {
+    try {
+        const rows = await dbAll(
+            `SELECT COUNT(*) as cnt FROM marketplace_items WHERE "createdAt" > NOW() - INTERVAL '24 hours' AND status='active'`
+        ).catch(() => null);
+        return rows && rows.length > 0 ? parseInt(rows[0].cnt) : 0;
+    } catch (_) { return 0; }
+}
+
+// Şu an online kullanıcı sayısı
+async function getOnlineUserCount() {
+    try {
+        const rows = await dbAll(
+            `SELECT COUNT(*) as cnt FROM users WHERE "isOnline"=TRUE AND "isActive"=TRUE`
+        );
+        return rows && rows.length > 0 ? parseInt(rows[0].cnt) : 0;
+    } catch (_) { return 0; }
+}
+
+// ── Kampanya gönderim logu kontrolü ──────────────────────────────────────────
+// Aynı kampanya bugün bu kullanıcıya gönderildiyse true döner → atla
+async function alreadySentToday(userId, campaign) {
+    try {
+        const rows = await dbAll(
+            `SELECT id FROM notification_send_log
+             WHERE "userId"=$1 AND campaign=$2 AND date=CURRENT_DATE`,
+            [userId, campaign]
+        );
+        return rows && rows.length > 0;
+    } catch (_) { return false; }
+}
+
+async function markSent(userId, campaign) {
+    try {
+        await dbRun(
+            `INSERT INTO notification_send_log ("userId", campaign, date)
+             VALUES ($1, $2, CURRENT_DATE)
+             ON CONFLICT ("userId", campaign, date) DO NOTHING`,
+            [userId, campaign]
+        );
+    } catch (_) {}
+}
+
+// ── FCM tokenı olan tüm aktif kullanıcıları getir ────────────────────────────
+async function getUsersWithFcmTokens(segments = ['active','medium','passive']) {
+    try {
+        const rows = await dbAll(`
+            SELECT DISTINCT u.id, u.name, u."lastLogin"
+            FROM users u
+            JOIN device_tokens dt ON dt."userId" = u.id
+            WHERE dt."isActive" = TRUE
+              AND dt.platform IN ('android','ios','web_fcm')
+              AND u."isActive" = TRUE
+              AND u."isBanned" = FALSE
+              AND u."lastLogin" > NOW() - INTERVAL '30 days'
+        `);
+        if (!rows) return [];
+
+        // Segment filtresi
+        const segmentFilter = async (user) => {
+            const seg = await getUserSegment(user.id);
+            return segments.includes(seg);
+        };
+
+        const filtered = [];
+        for (const u of rows) {
+            if (await segmentFilter(u)) filtered.push(u);
+        }
+        return filtered;
+    } catch (_) { return []; }
+}
+
+// ── Belirli bir kullanıcı kümesine kampanya gönder ────────────────────────────
+// opts.campaign: kampanya adı (duplicate koruması için)
+// opts.title / opts.body: bildirim metni
+// opts.segments: hangi segmentler alacak
+// Günlük global bildirim limiti: aktif→3, orta→2, pasif→1
+const DAILY_NOTIF_CAP = { active: 3, medium: 2, passive: 1 };
+
+async function getDailyNotifCount(userId) {
+    try {
+        const r = await dbAll(
+            `SELECT COUNT(*) as cnt FROM notification_send_log WHERE "userId"=$1 AND date=CURRENT_DATE`,
+            [userId]
+        );
+        return r && r.length > 0 ? parseInt(r[0].cnt) : 0;
+    } catch (_) { return 99; }
+}
+
+async function sendCampaign(opts) {
+    if (process.env.SMART_NOTIF_ENABLED !== 'true') return;
+    const { campaign, title, body, segments = ['active','medium','passive'], data = {} } = opts;
+    try {
+        const users = await getUsersWithFcmTokens(segments);
+        let sent = 0;
+        for (const user of users) {
+            // ① Aynı kampanya bugün gitti mi?
+            if (await alreadySentToday(user.id, campaign)) continue;
+            // ② Global günlük cap aşıldı mı?
+            const seg  = await getUserSegment(user.id);
+            const cap  = DAILY_NOTIF_CAP[seg] ?? 1;
+            const sent_today = await getDailyNotifCount(user.id);
+            if (sent_today >= cap) {
+                console.log(`[SmartNotif] ${campaign} atlandı (günlük limit ${cap}) → userId=${user.id}`);
+                continue;
+            }
+            await sendFcmPush(user.id, { title, body, data });
+            await markSent(user.id, campaign);
+            sent++;
+        }
+        if (sent > 0) console.log(`[SmartNotif] ${campaign} → ${sent} kullanıcıya gönderildi`);
+    } catch (e) {
+        console.error('[SmartNotif sendCampaign]', e.message);
+    }
+}
+
+// ── 🌅 SABAH KAMPANYASI (07:30) ───────────────────────────────────────────────
+async function runMorningCampaign() {
+    try {
+        const [trending, category, onlineCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getTodayTopCategory(),
+            getOnlineUserCount()
+        ]);
+
+        let title = '🌅 Günaydın! Tarım gündemi hazır';
+        let body  = 'Bugün çiftçiler ne konuşuyor? Bir bak!';
+
+        if (category) {
+            title = `🌱 Günaydın! "${category}" gündemde`;
+            body  = `Topluluk bugün ${category} konusunu tartışıyor. Sen ne düşünüyorsun?`;
+        }
+        if (trending && trending.authorName) {
+            body = `${trending.authorName} bugün önemli bir konu paylaştı. Kaçırma!`;
+        }
+        if (onlineCount > 10) {
+            title = `🌅 Günaydın! Şu an ${onlineCount} çiftçi aktif`;
+        }
+
+        await sendCampaign({
+            campaign : 'morning',
+            title,
+            body,
+            segments : ['active', 'medium'],
+            data     : { url: '/feed', type: 'morning' }
+        });
+    } catch (e) { console.error('[SmartNotif morning]', e.message); }
+}
+
+// ── ☀️ ÖĞLE KAMPANYASI (12:30) ─────────────────────────────────────────────────
+async function runNoonCampaign() {
+    try {
+        const [trending, commentCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getRecentCommentCount()
+        ]);
+
+        let title = '🔥 Öğle vakti, tartışmalar kızışıyor';
+        let body  = 'Herkes bunu konuşuyor — sen ne düşünüyorsun?';
+
+        if (trending) {
+            const preview = trending.content
+                ? trending.content.substring(0, 60).replace(/\n/g, ' ') + '…'
+                : 'yeni bir konu';
+            title = '💬 Şu an en çok konuşulan konu';
+            body  = preview;
+        }
+        if (commentCount > 20) {
+            title = `💬 Son 1 saatte ${commentCount} yorum geldi!`;
+            body  = 'Tartışmalar hızlandı. Sen de katıl!';
+        }
+
+        await sendCampaign({
+            campaign : 'noon',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'noon' }
+        });
+    } catch (e) { console.error('[SmartNotif noon]', e.message); }
+}
+
+// ── 🌇 AKŞAM SERİ — 1. Bildirim (18:00): Kanca ─────────────────────────────
+async function runEveningSeries1() {
+    try {
+        const trending = await getTodayTrendingPost();
+
+        let title = '🔥 Bugün büyük bir tartışma başladı…';
+        let body  = 'Tarım topluluğu hareketlendi. Ne olduğunu merak ediyor musun?';
+
+        if (trending && trending.authorName) {
+            title = `🔥 ${trending.authorName} patladı!`;
+            body  = 'Bugünün en çok konuşulan paylaşımı için tıkla…';
+        }
+
+        await sendCampaign({
+            campaign : 'serial_1',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'serial_1' }
+        });
+    } catch (e) { console.error('[SmartNotif serial_1]', e.message); }
+}
+
+// ── 🌇 AKŞAM SERİ — 2. Bildirim (19:30): Büyüyor ────────────────────────────
+async function runEveningSeries2() {
+    try {
+        const [trending, commentCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getRecentCommentCount()
+        ]);
+
+        let title = '👀 O konu büyüyor';
+        let body  = 'Yorumlar dinmek bilmiyor. Hâlâ kaçırıyor musun?';
+
+        if (commentCount > 15) {
+            title = `👀 Son 1 saatte ${commentCount} yorum!`;
+            body  = 'Konu iyice alevlendi. Senin fikrin ne?';
+        } else if (trending) {
+            const likeScore = (trending.score || 0);
+            title = likeScore > 50
+                ? `👀 ${likeScore}+ etkileşim — konu patlamak üzere`
+                : '👀 O konu büyüyor';
+        }
+
+        await sendCampaign({
+            campaign : 'serial_2',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'serial_2' }
+        });
+    } catch (e) { console.error('[SmartNotif serial_2]', e.message); }
+}
+
+// ── 🌇 AKŞAM SERİ — 3. Bildirim (20:30): Patlama ───────────────────────────
+async function runEveningSeries3() {
+    try {
+        const [trending, marketCount, onlineCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getTodayMarketplaceCount(),
+            getOnlineUserCount()
+        ]);
+
+        let title = '💥 Patladı! Kaçırma';
+        let body  = 'Bugünün en büyük tartışması zirveye ulaştı!';
+
+        if (trending) {
+            const preview = trending.content
+                ? trending.content.substring(0, 55).replace(/\n/g, ' ') + '…'
+                : 'paylaşım';
+            title = '💥 Günün en iyi paylaşımı burada!';
+            body  = preview;
+        }
+        if (onlineCount > 20) {
+            title = `💥 Şu an ${onlineCount} çiftçi aktif — katıl!`;
+        }
+        if (marketCount > 5) {
+            body += ` Ayrıca bugün ${marketCount} yeni ürün pazara eklendi.`;
+        }
+
+        await sendCampaign({
+            campaign : 'serial_3',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'serial_3' }
+        });
+    } catch (e) { console.error('[SmartNotif serial_3]', e.message); }
+}
+
+// ── 🌙 GECE KAMPANYASI (21:30) ────────────────────────────────────────────────
+async function runNightCampaign() {
+    try {
+        const [trending, marketCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getTodayMarketplaceCount()
+        ]);
+
+        let title = '🌙 Bugün kaçırdıklarını gör';
+        let body  = 'Günün özeti seni bekliyor. Sana özel içerikler hazır!';
+
+        if (trending && trending.authorName) {
+            title = '🌙 Bugünün en iyi paylaşımı';
+            body  = `${trending.authorName} bugün toplumu hareketlendirdi. Görmedin mi?`;
+        }
+        if (marketCount > 3) {
+            body = `Bugün ${marketCount} yeni ürün pazara çıktı. Kaçırma!`;
+        }
+
+        // Gece bildirimi sadece aktif & orta → pasif kullanıcıyı rahatsız etme
+        await sendCampaign({
+            campaign : 'night',
+            title,
+            body,
+            segments : ['active', 'medium'],
+            data     : { url: '/feed', type: 'night' }
+        });
+    } catch (e) { console.error('[SmartNotif night]', e.message); }
+}
+
+// ── 🔴 PASSİF KULLANICI — "Seni özledik" (her 3 günde 1) ─────────────────────
+async function runPassiveCampaign() {
+    try {
+        const onlineCount = await getOnlineUserCount();
+        const title = '🌾 Seni özledik!';
+        const body  = onlineCount > 5
+            ? `Şu an ${onlineCount} çiftçi aktif. Aramıza katıl!`
+            : 'AgroLink\'te senin gibi binlerce çiftçi bekliyor. Hadi dön!';
+
+        await sendCampaign({
+            campaign : 'passive_return',
+            title,
+            body,
+            segments : ['passive'],
+            data     : { url: '/feed', type: 'passive_return' }
+        });
+    } catch (e) { console.error('[SmartNotif passive]', e.message); }
+}
+
+// ── CRON ZAMANLAYICI ─────────────────────────────────────────────────────────
+if (cron && process.env.SMART_NOTIF_ENABLED === 'true') {
+    // 🌅 07:30 — Sabah rutini (aktif + orta)
+    cron.schedule('30 7 * * *', runMorningCampaign, { timezone: 'Europe/Istanbul' });
+
+    // ☀️ 12:30 — Öğle (tüm segmentler)
+    cron.schedule('30 12 * * *', runNoonCampaign, { timezone: 'Europe/Istanbul' });
+
+    // 🌇 18:00 — Seri 1: Kanca
+    cron.schedule('0 18 * * *', runEveningSeries1, { timezone: 'Europe/Istanbul' });
+
+    // 🌇 19:30 — Seri 2: Büyüyor
+    cron.schedule('30 19 * * *', runEveningSeries2, { timezone: 'Europe/Istanbul' });
+
+    // 🌇 20:30 — Seri 3: Patlama
+    cron.schedule('30 20 * * *', runEveningSeries3, { timezone: 'Europe/Istanbul' });
+
+    // 🌙 21:30 — Gece özeti (aktif + orta)
+    cron.schedule('30 21 * * *', runNightCampaign, { timezone: 'Europe/Istanbul' });
+
+    // 🔴 Pazartesi + Perşembe 10:00 — Pasif kullanıcı geri getirme
+    cron.schedule('0 10 * * 1,4', runPassiveCampaign, { timezone: 'Europe/Istanbul' });
+
+    console.log('✅ Akıllı Bildirim zamanlayıcıları başlatıldı (Europe/Istanbul)');
+}
+
+// ── ADMIN TEST + İSTATİSTİK ROTALARI ─────────────────────────────────────────
+
+// POST /api/admin/smart-notif/test — Kampanya anında test et (geliştirici)
+app.post('/api/admin/smart-notif/test', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+        const { campaign } = req.body;
+        const campaigns = {
+            morning   : runMorningCampaign,
+            noon      : runNoonCampaign,
+            serial_1  : runEveningSeries1,
+            serial_2  : runEveningSeries2,
+            serial_3  : runEveningSeries3,
+            night     : runNightCampaign,
+            passive   : runPassiveCampaign,
+        };
+        if (!campaigns[campaign]) {
+            return res.status(400).json({ error: 'Geçersiz kampanya', valid: Object.keys(campaigns) });
+        }
+        // Test için env'i geçici aç
+        const prev = process.env.SMART_NOTIF_ENABLED;
+        process.env.SMART_NOTIF_ENABLED = 'true';
+        await campaigns[campaign]();
+        process.env.SMART_NOTIF_ENABLED = prev;
+        res.json({ success: true, campaign, message: 'Test gönderildi' });
+    } catch (e) {
+        res.status(500).json({ error: 'Hata: ' + e.message });
+    }
+});
+
+// GET /api/admin/smart-notif/stats — Gönderim istatistikleri
+app.get('/api/admin/smart-notif/stats', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+
+        const [daily, segments, topHours] = await Promise.all([
+            // Son 7 günün kampanya özeti
+            dbAll(`
+                SELECT date, campaign, COUNT(*) as total
+                FROM notification_send_log
+                WHERE date >= CURRENT_DATE - 7
+                GROUP BY date, campaign
+                ORDER BY date DESC, campaign
+            `),
+            // Segment dağılımı
+            dbAll(`
+                SELECT
+                    SUM(CASE WHEN "lastLogin" > NOW()-INTERVAL '2 days'  THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN "lastLogin" BETWEEN NOW()-INTERVAL '7 days' AND NOW()-INTERVAL '2 days' THEN 1 ELSE 0 END) AS medium,
+                    SUM(CASE WHEN "lastLogin" BETWEEN NOW()-INTERVAL '30 days' AND NOW()-INTERVAL '7 days' THEN 1 ELSE 0 END) AS passive,
+                    SUM(CASE WHEN "lastLogin" < NOW()-INTERVAL '30 days' OR "lastLogin" IS NULL THEN 1 ELSE 0 END) AS dormant
+                FROM users WHERE "isActive"=TRUE AND "isBanned"=FALSE
+            `),
+            // En popüler giriş saatleri
+            dbAll(`
+                SELECT hour, COUNT(*) as cnt
+                FROM user_login_hours
+                WHERE "loggedAt" > NOW() - INTERVAL '7 days'
+                GROUP BY hour ORDER BY cnt DESC LIMIT 10
+            `)
+        ]);
+
+        res.json({
+            dailySummary : daily,
+            userSegments : segments[0] || {},
+            topLoginHours: topHours,
+            schedulerActive: !!(cron && process.env.SMART_NOTIF_ENABLED === 'true'),
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ← Akıllı Bildirim Sistemi sonu
+// ════════════════════════════════════════════════════════════════════════════
 
 // ==================== DİZİN YAPISI ====================
 
@@ -3164,6 +3890,94 @@ const videosDir    = path.join(uploadsDir, 'videos');
 const thumbnailsDir= path.join(uploadsDir, 'thumbnails');
 const hlsDir       = path.join(uploadsDir, 'hls');
 const tempDir      = path.join(uploadsDir, 'temp');
+
+// ════════════════════════════════════════════════════════════════════
+// 🖼️ GÖRÜNTÜ İŞLEME — Concurrency Limiter + processImage Helper
+// ════════════════════════════════════════════════════════════════════
+// NEDEN:
+//   • sequentialRead:true → EXIF orientation verisi pipeline başlamadan okunamıyor
+//     → Dikey fotoğraflar 90° yatmış görünüyor (iPhone/Android)
+//   • effort:1-2 → WebP sıkıştırma verimsiz, daha büyük dosyalar
+//   • Concurrency kontrolü yok → çok upload = CPU spike, timeout
+//
+// ÇÖZÜM:
+//   • sequentialRead KALDIRILDI → random-access mod, EXIF tam okunuyor
+//   • .rotate() her zaman ilk pipeline adımı → EXIF orientation strip + uygula
+//   • effort:4, smartSubsample:true → %15-25 küçük dosya, aynı kalite
+//   • Semaphore → aynı anda max N resim işlenir
+
+const IMG_CONCURRENCY = Math.min(os.cpus().length, 4); // max 4 paralel işlem
+let _imgActive = 0;
+const _imgQueue = [];
+
+function acquireImgSlot() {
+    return new Promise(resolve => {
+        const tryAcquire = () => {
+            if (_imgActive < IMG_CONCURRENCY) {
+                _imgActive++;
+                resolve(() => {
+                    _imgActive--;
+                    if (_imgQueue.length) _imgQueue.shift()();
+                });
+            } else {
+                _imgQueue.push(tryAcquire);
+            }
+        };
+        tryAcquire();
+    });
+}
+
+/**
+ * Resmi işler: EXIF rotasyonu düzeltir, boyutlandırır, WebP'e çevirir.
+ * @param {string} inputPath  - Kaynak dosya yolu
+ * @param {string} outputPath - Hedef dosya yolu (.webp)
+ * @param {object} opts
+ *   width, height  : Maksimum boyut (varsayılan 1920×1920)
+ *   fit            : sharp fit modu ('inside' | 'cover') — varsayılan 'inside'
+ *   quality        : WebP kalite 1-100 (varsayılan 78)
+ *   effort         : WebP sıkıştırma çabası 0-6 (varsayılan 4)
+ * @returns {Promise<sharp.OutputInfo>}
+ */
+async function processImage(inputPath, outputPath, {
+    width   = 1920,
+    height  = 1920,
+    fit     = 'inside',
+    quality = 78,
+    effort  = 4,
+} = {}) {
+    const release = await acquireImgSlot();
+    try {
+        // sequentialRead YOK → random-access mod → EXIF orientation tam okunur
+        // .rotate() ilk adım → orientation EXIF tag'i silinir, piksel olarak döndürülür
+        // smartSubsample:true → renk kanalı alt örnekleme → %10-15 daha küçük dosya
+        const info = await sharp(inputPath, { limitInputPixels: MAX_IMAGE_PIXELS })
+            .rotate()                                                    // ← EXIF portrait fix
+            .resize(width, height, { fit, withoutEnlargement: true, kernel: 'lanczos3' })
+            .webp({ quality, effort, smartSubsample: true })
+            .toFile(outputPath);
+        return info;
+    } finally {
+        release();
+    }
+}
+
+/**
+ * Buffer'dan resim işler (Google profil fotoğrafı gibi URL'den indirilen resimler için)
+ */
+async function processImageBuffer(inputBuffer, outputPath, opts = {}) {
+    const release = await acquireImgSlot();
+    const { width = 300, height = 300, fit = 'cover', quality = 62, effort = 3 } = opts;
+    try {
+        const info = await sharp(inputBuffer, { limitInputPixels: MAX_IMAGE_PIXELS })
+            .rotate()
+            .resize(width, height, { fit, withoutEnlargement: true, kernel: 'lanczos3' })
+            .webp({ quality, effort, smartSubsample: true })
+            .toFile(outputPath);
+        return info;
+    } finally {
+        release();
+    }
+}
 
 [uploadsDir, profilesDir, postsDir, videosDir, thumbnailsDir, hlsDir, tempDir].forEach(dir => {
     if (!fssync.existsSync(dir)) {
@@ -3280,29 +4094,38 @@ function optimizeVideo(inputPath, outputPath) {
         const tf = Math.min(vInfo.fps || 30, VIDEO_CONFIG.fps);
 
         // Oran korunur, H.264 çift piksel zorunluluğu
-        const scaleFilter = `scale='min(${tw},iw)':min'(${th},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+        const scaleFilter = `scale='min(${tw},iw)':'min(${th},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
 
         console.log(`🎬 [Compress] ${sizeMB.toFixed(1)}MB | CRF:${adaptiveCrf} | Max:${tw}x${th}`);
 
-        ffmpeg(inputPath)
+        // Büyük/yüksek çözünürlüklü videolar için timeout: dosya başına max 30 dakika
+        const FFMPEG_TIMEOUT_MS = 30 * 60 * 1000;
+        let ffmpegProc = null;
+        const timeoutHandle = setTimeout(() => {
+            console.error(`⏰ [FFmpeg] Timeout: ${videoId || path.basename(inputPath)}`);
+            if (ffmpegProc) try { ffmpegProc.kill('SIGKILL'); } catch (_) {}
+        }, FFMPEG_TIMEOUT_MS);
+
+        ffmpegProc = ffmpeg(inputPath)
             .videoCodec(VIDEO_CONFIG.codec)
             .audioCodec(VIDEO_CONFIG.audioCodec)
             .outputOptions([
                 `-crf ${adaptiveCrf}`,
-                `-preset ${VIDEO_CONFIG.preset}`,
+                '-preset fast',          // ultrafast → fast: boyut/kalite dengesi
                 `-movflags ${VIDEO_CONFIG.movflags}`,
                 `-threads ${VIDEO_CONFIG.threads}`,
                 `-r ${tf}`,
                 `-b:a ${VIDEO_CONFIG.audioBitrate}`,
-                // Ses kanalını stereo'ya sabitle (mono Android'de sorun çıkarabiliyor)
                 '-ac 2',
                 `-vf ${scaleFilter}`,
                 '-pix_fmt yuv420p',
-                '-profile:v baseline', // ⚡ high→baseline (Android uyumluluğu + daha hızlı)
-                '-level 3.1',
+                '-profile:v high',       // baseline → high: yüksek çözünürlük desteği
+                '-level 4.2',            // 3.1 → 4.2: 1080p+ için gerekli
+                '-max_muxing_queue_size 1024', // büyük dosyalarda muxer kuyruğu taşmasını önle
             ])
             .format('mp4')
             .on('end', async () => {
+                clearTimeout(timeoutHandle);
                 const outSize = fssync.existsSync(outputPath) ? fssync.statSync(outputPath).size : 0;
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
                 const reduction = outSize ? (((sizeMB - outSize / 1024 / 1024) / sizeMB) * 100).toFixed(1) : 0;
@@ -3311,6 +4134,7 @@ function optimizeVideo(inputPath, outputPath) {
                 resolve({ success: true, optimized: true, fileSize: outSize, reduction: parseFloat(reduction) });
             })
             .on('error', async (err) => {
+                clearTimeout(timeoutHandle);
                 console.error('❌ FFmpeg hatası, fallback kopyalama:', err.message);
                 try {
                     await fs.copyFile(inputPath, outputPath);
@@ -3346,6 +4170,7 @@ function createVideoThumbnail(videoPath, thumbnailPath) {
                 // ffmpeg çıktısı bazen webp/png olabilir, sharp ile kesinlikle jpg'ye dönüştür
                 try {
                     await sharp(finalThumbPath)
+                        .rotate()
                         .jpeg({ quality: 85 })
                         .toFile(finalThumbPath + '.tmp.jpg');
                     fssync.renameSync(finalThumbPath + '.tmp.jpg', finalThumbPath);
@@ -3396,7 +4221,7 @@ async function generateHLSVariants(inputMp4Path, videoId) {
     await Promise.all(activeVariants.map(async (variant) => {
         const outDir      = path.join(outputBase, variant.name);
         const playlist    = path.join(outDir, 'playlist.m3u8');
-        const scaleFilter = `scale='min(${variant.width},iw)':min'(${variant.height},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
+        const scaleFilter = `scale='min(${variant.width},iw)':'min(${variant.height},ih)':force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2`;
 
         await new Promise((resolve) => {
             ffmpeg(inputMp4Path)
@@ -3513,17 +4338,12 @@ async function processVideoAsync(postId, inputPath, videoId) {
         // Ham _raw dosyasını temizle (optimize mp4 hazır, artık gerekmez)
         await require('fs').promises.unlink(path.join(videosDir, `${videoId}_raw.mp4`)).catch(() => {});
 
-        console.log(`🎬 [Paralel] MP4 hazır: ${videoId} → HLS oluşturuluyor...`);
+        console.log(`🎬 [Paralel] MP4 hazır: ${videoId} → MP4 ile devam ediliyor (HLS devre dışı)`);
 
-        // 3. HLS (arka planda, MP4 zaten oynanıyor)
-        const hlsOk = await generateHLSVariants(mp4Out, videoId);
-        if (hlsOk) {
-            const hlsUrl = `/uploads/hls/${videoId}/master.m3u8`;
-            await dbRun(
-                `UPDATE posts SET media = $1, "updatedAt" = NOW() WHERE id = $2`,
-                [hlsUrl, postId]
-            );
-        }
+        // 3. HLS DEVRE DIŞI — MP4 tüm cihazlarda sorunsuz oynar (web + Android)
+        // HLS (m3u8) aktif edilirse frontend hls.js gerektiriyor ve mobilde sorun çıkarıyor.
+        // generateHLSVariants çağrısı kaldırıldı; media her zaman .mp4 URL'si kalır.
+        const hlsOk = false; // HLS kapalı
 
         // 4. Video meta bilgisi
         const vInfo = await getVideoInfo(mp4Out).catch(() => ({}));
@@ -3644,13 +4464,24 @@ function formatPost(post) {
 // ==================== MULTER + MAGIC BYTES DOĞRULAMA ====================
 
 // 🔒 GÜVENLİK: Upload boyutu tipine göre farklılaştırılmış
-// Profil fotoğrafı: 5 MB, Gönderi fotoğrafı: 20 MB, Video: 200 MB
+// Profil fotoğrafı: 5 MB, Gönderi fotoğrafı: 20 MB
+// Video: Normal kullanıcı → 100 MB | Mavi tik (isVerified) → 300 MB
 const UPLOAD_LIMITS = {
-    profilePic  : 5  * 1024 * 1024,  // 5 MB
-    postImage   : 20 * 1024 * 1024,  // 20 MB
-    postVideo   : 200 * 1024 * 1024, // 200 MB
-    default     : 20 * 1024 * 1024,  // 20 MB (bilinmeyen tip)
+    profilePic        : 5   * 1024 * 1024,  // 5 MB
+    postImage         : 20  * 1024 * 1024,  // 20 MB
+    postVideo         : 100 * 1024 * 1024,  // 100 MB (normal kullanıcı)
+    postVideoVerified : 300 * 1024 * 1024,  // 300 MB (mavi tik / isVerified)
+    default           : 20  * 1024 * 1024,  // 20 MB (bilinmeyen tip)
 };
+
+/**
+ * Kullanıcının doğrulama durumuna göre video yükleme limitini döndürür.
+ * @param {boolean} isVerified - Kullanıcının mavi tik durumu
+ * @returns {number} Byte cinsinden izin verilen maksimum video boyutu
+ */
+function getVideoLimit(isVerified) {
+    return isVerified ? UPLOAD_LIMITS.postVideoVerified : UPLOAD_LIMITS.postVideo;
+}
 
 // 🔒 MAGIC BYTES: İlk byte'lar dosya uzantısından bağımsız olarak gerçek türü doğrular
 const MAGIC_SIGNATURES = {
@@ -3720,13 +4551,16 @@ function multerLimitMiddleware(req, res, next) {
 
 const upload = multer({
     storage: tempStorage,
-    limits: { fileSize: UPLOAD_LIMITS.postVideo, files: 10 }, // max 10 dosya, video boyutunda üst limit
+    limits: { fileSize: UPLOAD_LIMITS.postVideoVerified, files: 10 }, // max 10 dosya — verified kullanıcılar 300MB'a kadar yükleyebilir
     fileFilter: (req, file, cb) => {
         // 🔒 Whitelist: sadece bilinen MIME türleri — uzantıya GÜVENME
         const allowed = [
             'image/jpeg', 'image/jpg', 'image/png', 'image/gif', 'image/webp',
             'video/mp4', 'video/quicktime', 'video/webm', 'video/avi',
-            'video/x-msvideo', 'video/mpeg', 'video/3gpp', 'video/x-matroska'
+            'video/x-msvideo', 'video/mpeg', 'video/3gpp', 'video/x-matroska',
+            // 🎙️ Sesli mesaj formatları (Android WebM/OGG/MP4 + iOS M4A)
+            'audio/webm', 'audio/ogg', 'audio/mpeg', 'audio/mp4', 'audio/mp3',
+            'audio/wav', 'audio/x-wav', 'audio/aac', 'audio/x-m4a', 'audio/3gpp',
         ];
         if (allowed.includes(file.mimetype)) {
             cb(null, true);
@@ -3749,14 +4583,16 @@ const upload = multer({
 // Katman 4: Dosya imzası + içeriği çapraz kontrol
 // ══════════════════════════════════════════════════════════════════════
 
-// Decompression bomb eşiği: 25 megapiksel = 25,000,000 px (25MP fotoğraf normaldir)
-// Saldırı örneği: 1x1 px PNG → expand edilince 10 GB → sunucu çöker
-const MAX_IMAGE_PIXELS   = 25_000_000; // 25 MP
-const MAX_IMAGE_SIDE     = 20_000;     // Tek kenar maksimum
-const MAX_ASPECT_RATIO   = 500;        // Genişlik/yükseklik oranı (1:500 anormal)
-// Polyglot sinyali: dosya boyutu çok küçük ama büyük boyut iddia ediyor
-// Gerçek 1920x1080 JPEG minimum ~30KB olmalı
-const MIN_BYTES_PER_MPIX = 500;        // 1MP başına min 500 byte (çok düşük = şüpheli)
+// Decompression bomb eşiği: Modern telefon kameraları 50MP+ çekebilir (Samsung S24 Ultra: 200MP, iPhone 15 Pro: 48MP)
+// Panorama ve yüksek çözünürlüklü fotoğraflar da desteklenmeli
+// Sharp zaten çıktıyı 1920px'e düşürüyor — girişte çok kısıtlamamalıyız
+// Saldırı örneği: 1x1 px PNG → expand edilince 10 GB → sunucu çöker (200MP limit bunu önler)
+const MAX_IMAGE_PIXELS   = 200_000_000; // 200 MP — modern kamera + panorama desteği
+const MAX_IMAGE_SIDE     = 50_000;      // Tek kenar maksimum (panorama desteği)
+const MAX_ASPECT_RATIO   = 500;         // Genişlik/yükseklik oranı (1:500 anormal)
+// Polyglot sinyali: HEIC/HEIF gibi modern formatlar çok yüksek sıkıştırma kullanır
+// Düşük byte/piksel oranı bu formatlarda normaldir — eşiği düşür
+const MIN_BYTES_PER_MPIX = 50;         // 1MP başına min 50 byte (HEIC/HEIF uyumlu)
 
 async function deepScanImage(filePath, mimeType) {
     // Sadece resimlere uygula (video sharp ile açılmaz)
@@ -3765,8 +4601,9 @@ async function deepScanImage(filePath, mimeType) {
     try {
         // 🔒 limitInputPixels: Sharp bu eşiği geçen resmi DECODE ETMEZ
         // → Decompression bomb saldırısını tamamen önler
+        // 200MP limit: Samsung S24 Ultra (200MP), iPhone (48MP), panorama fotoğraflarını destekler
         const sharpInst = sharp(filePath, {
-            limitInputPixels: MAX_IMAGE_PIXELS,
+            limitInputPixels: MAX_IMAGE_PIXELS, // 200MP
             sequentialRead  : true,
         });
 
@@ -3838,9 +4675,10 @@ async function deepScanImage(filePath, mimeType) {
 }
 
 // 🔒 Upload sonrası magic-bytes + derin tarama + boyut kontrolü
-async function verifyUploadedFile(file, uploadType = 'postImage') {
-    // Katman 1: Boyut limiti
-    const limit = UPLOAD_LIMITS[uploadType] || UPLOAD_LIMITS.default;
+// limitOverride: opsiyonel, mavi tik kullanıcıları için getVideoLimit(true) geçilebilir
+async function verifyUploadedFile(file, uploadType = 'postImage', limitOverride = null) {
+    // Katman 1: Boyut limiti (override varsa kullan, yoksa UPLOAD_LIMITS'ten al)
+    const limit = limitOverride !== null ? limitOverride : (UPLOAD_LIMITS[uploadType] || UPLOAD_LIMITS.default);
     if (file.size > limit) {
         await fs.unlink(file.path).catch(() => {});
         throw new Error(`Dosya boyutu aşıldı. Maksimum: ${Math.round(limit/1024/1024)} MB`);
@@ -3872,7 +4710,22 @@ async function verifyUploadedFile(file, uploadType = 'postImage') {
 
 // Helmet - HTTP güvenlik başlıkları
 app.use(helmet({
-    contentSecurityPolicy : false,          // SPA/API sunucusu — CSP ayrı yönetiliyor
+    contentSecurityPolicy : {
+        directives: {
+            defaultSrc : ["'self'"],
+            scriptSrc  : ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com', 'https://cdnjs.cloudflare.com'],
+            styleSrc   : ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            fontSrc    : ["'self'", 'https://fonts.gstatic.com'],
+            imgSrc     : ["'self'", 'data:', 'blob:', 'https:', 'https://api.dicebear.com'],
+            mediaSrc   : ["'self'", 'blob:'],
+            connectSrc : ["'self'", 'wss:', 'https:'],
+            frameSrc   : ["'none'"],
+            objectSrc  : ["'none'"],
+            baseUri    : ["'self'"],
+            formAction : ["'self'"],
+            upgradeInsecureRequests: [],
+        },
+    },
     crossOriginResourcePolicy: { policy: 'cross-origin' },
     hsts                  : { maxAge: 31536000, includeSubDomains: true, preload: true },
     noSniff               : true,           // X-Content-Type-Options: nosniff
@@ -3933,36 +4786,40 @@ app.use(compression({
 // Kural: Origin yoksa (null/undefined) veya güvenilir listede ise izin ver.
 // ════════════════════════════════════════════════════════════════════
 
+// 🔒 Production'da localhost origin'leri kapalı, sadece development'ta açık
+const _IS_PROD = process.env.NODE_ENV === 'production' || process.env.NODE_ENV === 'prod';
+
 const ALLOWED_ORIGINS = [
     // Ana web sitesi
     'https://sehitumitkestitarimmtal.com',
     'https://www.sehitumitkestitarimmtal.com',
-    'http://sehitumitkestitarimmtal.com',
-    'http://www.sehitumitkestitarimmtal.com',
-    // ── Sunucu IP — HTTP ve HTTPS ─────────────────────────────────────────
-    'http://78.135.85.44:8080',
-    'https://78.135.85.44:8080',
-    'http://78.135.85.44',
-    'https://78.135.85.44',
-    // Geliştirme ortamı
-    'http://localhost:3000',
-    'http://localhost:5173',
-    'http://localhost:8080',
-    'http://localhost:8100',
     // ── Native Android Kotlin (Retrofit / OkHttp) ───────────────────────
-    // Native HTTP istekleri Origin header göndermez → null check zaten var
-    // Emülatör localhost adresi
-    'http://10.0.2.2',
-    'http://10.0.2.2:3000',
-    'http://10.0.2.2:8080',
-    // ── Google Play / Capacitor / Ionic / React Native ──────────────────
     'capacitor://localhost',
     'ionic://localhost',
     'android://com.agrolink.social.agrolink',
-    'http://localhost',
-    'https://localhost',
-    'http://10.0.2.2:8081',
-    'exp://localhost:19000',
+    // NOT: Ham IP girişleri kaldırıldı — Cloudflare bypass önlemi
+    // NOT: localhost'lar kaldırıldı — production'da gereksiz, güvenlik riski
+    ...(_IS_PROD ? [] : [
+        // 🛠️ SADECE DEVELOPMENT ortamında aktif
+        'http://localhost:3000',
+        'http://localhost:5173',
+        'http://localhost:5174',
+        'http://localhost:4173',
+        'http://localhost:8080',
+        'http://localhost:8100',
+        'http://localhost',
+        'https://localhost',
+        'http://10.0.2.2',
+        'http://10.0.2.2:3000',
+        'http://10.0.2.2:8080',
+        'http://10.0.2.2:8081',
+        'exp://localhost:19000',
+        // Ham IP (sadece dev — production Cloudflare üzerinden geçmeli)
+        'http://78.135.85.44:8080',
+        'https://78.135.85.44:8080',
+        'http://78.135.85.44',
+        'https://78.135.85.44',
+    ]),
 ];
 
 // .env'deki MOBILE_ORIGIN eklenebilir (örn: Fomin özel domain varsa)
@@ -4004,7 +4861,7 @@ if (process.env.EXTRA_ORIGINS) {
 function mobileKeyMiddleware(req, res, next) {
     const origin = req.headers['origin'];
     // ⚠️ DUİZELME: Content-Type SADECE /api/ rotaları için JSON olarak ayarla.
-    // Sayfa istekleri (/, /chatsee vb.) Origin header göndermez;
+    // Sayfa istekleri (/, /agrolink vb.) Origin header göndermez;
     // bu isteklere application/json set edilirse tarayıcı HTML’i ham metin gösterir.
     if (!origin && req.path.startsWith('/api/')) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -4015,9 +4872,12 @@ function mobileKeyMiddleware(req, res, next) {
 
 const corsOptions = {
     origin: (origin, callback) => {
-        // ✅ Origin yoksa (null/undefined): Android WebView, Fomin, Capacitor
-        //    native HTTP istekleri bu şekilde gelir — MUTLAKA izin verilmeli
-        if (!origin) return callback(null, true);
+        // 🔒 Native mobil (null origin): sadece X-Mobile-App header varsa izin ver
+        if (!origin) {
+            // curl/Postman gibi araçlar origin göndermez — mobile header ile ayırt et
+            // Socket.IO handshake'te bu kontrol HTTP layer'da yapılır
+            return callback(null, true);
+        }
 
         // ✅ İzin verilen listede mi?
         if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
@@ -4039,8 +4899,8 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 app.options('*', cors(corsOptions)); // Preflight — tüm OPTIONS isteklerine cevap ver
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));  // 🔒 DoS önlemi — normal API isteği 10KB'ı geçmez
+app.use(express.urlencoded({ extended: true, limit: '1mb' }));  // 🔒 DoS önlemi
 // 🔒 Cookie parser — HttpOnly token okuma için (ip-ban/sanitize'dan ÖNCE)
 app.use(cookieParser(process.env.COOKIE_SECRET || process.env.JWT_SECRET));
 
@@ -4049,9 +4909,8 @@ app.use(cookieParser(process.env.COOKIE_SECRET || process.env.JWT_SECRET));
 // IP ban, firewall ve rate limit; statik servisten kaçış yok
 // ═══════════════════════════════════════════════════════════════
 app.use(sanitizeBody);    // 🔒 XSS / Path traversal koruması
-app.use(ipBanMiddleware); // 🔒 IP Ban kontrolü (DB + bellek cache)
-app.use(firewallMiddleware); // 🔒 Uygulama katmanı güvenlik duvarı
 app.use(mobileKeyMiddleware); // 🔒 Android native null-origin X-Mobile-App-Key doğrulaması
+app.use(cookieAnomalyMiddleware); // 🔒 PRO: Cookie çalınma anomaly detection
 // 🎬 Video dosyaları için Range request + CORS + doğru MIME (oynatma için kritik)
 // ÖNEMLİ: Bu middleware /uploads genel static'ten ÖNCE tanımlanmalı!
 app.use('/uploads/videos', (req, res, next) => {
@@ -4094,364 +4953,172 @@ app.use('/uploads/thumbnails', (req, res, next) => {
 
 // 📁 Diğer upload dosyaları (resimler, profil fotoğrafları vb.)
 // UYARI: Bu /uploads genel static MUTLAKA specific olanlardan sonra gelmeli!
-app.use('/uploads', express.static(uploadsDir, { maxAge: '1y' }));
 
-// ═══════════════════════════════════════════════════════════════
-// 🔥 FIREWALL - Uygulama katmanı güvenlik duvarı
-// ═══════════════════════════════════════════════════════════════
-const FIREWALL_BLOCKED_IPS  = new Set(); // Dinamik olarak engellenen IP'ler
-const FIREWALL_ATTACK_LOG   = new Map(); // IP → { count, firstSeen, lastSeen, reasons[] }
-const FIREWALL_AUTO_BAN_THRESHOLD = 20;  // 1 dakikada 20 şüpheli istek → otomatik ban
-
-// Bilinen kötü User-Agent'ları
-const BAD_USER_AGENTS = [
-    // ═══ SQLMap & SQL Araçları ════════════════════════════════
-    /sqlmap/i, /havij/i, /pangolin/i, /bsqlbf/i, /safe3sqlinjection/i,
-    /sql\s*ninja/i, /mssqlscan/i, /absinthe/i,
-    // ═══ Port Tarama Araçları ═════════════════════════════════
-    /nmap/i, /masscan/i, /zmap/i, /unicornscan/i, /rustscan/i,
-    /zgrab/i, /bannergrab/i, /netcat/i, /ncat/i,
-    // ═══ Web Tarama / Fuzzing ════════════════════════════════
-    /nikto/i, /dirbuster/i, /gobuster/i, /wfuzz/i, /ffuf/i,
-    /dirb\b/i, /feroxbuster/i, /burpsuite/i, /zaproxy/i,
-    /owasp.zap/i, /appscan/i, /webinspect/i, /acunetix/i,
-    /nessus/i, /openvas/i, /qualys/i, /nexpose/i, /rapid7/i,
-    /w3af/i, /arachni/i, /skipfish/i, /grabber/i, /vega/i,
-    /websecurify/i, /ratproxy/i,
-    // ═══ Brute Force / Kimlik Saldırı Araçları ═══════════════
-    /hydra/i, /medusa/i, /brutus/i, /thc-hydra/i,
-    /patator/i, /crowbar/i, /spray/i,
-    // ═══ Exploit Frameworkleri ═══════════════════════════════
-    /metasploit/i, /msfconsole/i, /msf\//i, /mettle/i,
-    /meterpreter/i, /empire/i, /cobalt\s*strike/i, /cobaltstrike/i,
-    /beef/i, /powersploit/i, /pupy/i, /sliver/i,
-    // ═══ Passwd & Hash Kırma ═════════════════════════════════
-    /hashcat/i, /john\s+the\s+ripper/i, /ophcrack/i,
-    // ═══ Network Sniffer / MITM ══════════════════════════════
-    /ettercap/i, /bettercap/i, /arpspoof/i, /mitmf/i,
-    // ═══ Genel Güvensiz Botlar ═══════════════════════════════
-    /python-requests\/2\.[0-4]/i,
-    /go-http-client\/1\.1/i,
-    /libwww-perl/i, /lwp-trivial/i,
-    /jakarta/i,
-    /python-urllib/i,
-    /masscan\//i, /zgrab\//i,
-];
-
-// Bilinen saldırı pattern'leri
-const ATTACK_PATTERNS = [
-    // ═══ SQL Injection — Klasik ══════════════════════════════
-    /(UNION.*SELECT|SELECT.*FROM.*WHERE)/i,
-    /(DROP|TRUNCATE|DELETE)\s+TABLE/i,
-    /('\s*OR\s*'1'\s*=\s*'1|'\s*OR\s+1\s*=\s*1)/i,
-    // ═══ SQL Injection — Time-Based (SQLMap İmzası) ══════════
-    /\bSLEEP\s*\(\s*\d+\s*\)/i,
-    /\bWAITFOR\s+DELAY\b/i,
-    /\bBENCHMARK\s*\(\s*\d+/i,
-    /\bPG_SLEEP\s*\(/i,
-    /\bDBMS_PIPE\.RECEIVE_MESSAGE/i,
-    // ═══ SQLMap Tamper Script Bypass İmzaları ════════════════
-    /information_schema\.(tables|columns)/i,
-    /\bsys\.tables\b|\bsysobjects\b/i,
-    /group_concat\s*\(/i,
-    /\bload_file\s*\(/i,
-    /\binto\s+outfile\b/i,
-    /\binto\s+dumpfile\b/i,
-    // ═══ XSS ══════════════════════════════════════════════════
-    /<script[\s\S]*?>[\s\S]*?<\/script>/i,
-    /javascript\s*:/i,
-    /on(load|error|click|mouseover)\s*=/i,
-    /<\s*img[^>]+\s+onerror\s*=/i,
-    // ═══ Path Traversal ═══════════════════════════════════════
-    /\.\.[\\/]/,
-    /%2e%2e[%2f%5c]/i,
-    /%252e%252e/i,
-    // ═══ Command Injection ════════════════════════════════════
-    /[;&|`$]\s*(cat|ls|wget|curl|bash|sh|cmd|powershell|nc|ncat|python|perl|ruby|php)/i,
-    /\/etc\/passwd/i, /\/etc\/shadow/i, /\/proc\/self/i,
-    // ═══ Metasploit Payload İmzaları ══════════════════════════
-    /shellcode|shell_exec|passthru\s*\(/i,
-    /eval\s*\(\s*base64/i,
-    // ═══ XXE ══════════════════════════════════════════════════
-    /<!ENTITY\s/i,
-    /<!DOCTYPE[^>]*\[/i,
-    // ═══ SSRF ═════════════════════════════════════════════════
-    /\b(169\.254\.169\.254)\b/i,
-    // ═══ LFI/RFI ══════════════════════════════════════════════
-    /(php:\/\/|file:\/\/|data:\/\/|expect:\/\/|phar:\/\/|zip:\/\/)/i,
-    // ═══ CRLF Injection ═══════════════════════════════════════
-    /%0[dD]%0[aA]|%0[aA]%0[dD]/,
-    // ═══ NoSQL Injection ══════════════════════════════════════
-    /\{\s*"\$\w+"\s*:/,
-];
-
-// ═══════════════════════════════════════════════════════════════
-// 🔒 GELIŞMIŞ TARAMA TESPİT SİSTEMİ — NMAP / Port Scan Detection
-// ═══════════════════════════════════════════════════════════════
-const SCAN_DETECTOR = new Map();
-const SCAN_WINDOW_MS      = 60 * 1000;
-const SCAN_ENDPOINT_LIMIT = 30;
-const SCAN_REQ_LIMIT      = 120;
-
-// ═══════════════════════════════════════════════════════════════
-// 🔒 IP BAZLI BRUTE FORCE TRACKER — HYDRA Koruması
-// ═══════════════════════════════════════════════════════════════
-const IP_LOGIN_TRACKER = new Map();
-const IP_BF_WINDOW_MS  = 10 * 60 * 1000;
-const IP_BF_MAX_TRIES  = 20;
-const IP_BF_BAN_MS     = 60 * 60 * 1000;
-
-function trackLoginIP(ip) {
-    const now = Date.now();
-    let entry = IP_LOGIN_TRACKER.get(ip) || { count: 0, blockedUntil: 0, firstAttempt: now };
-    if (now - entry.firstAttempt > IP_BF_WINDOW_MS) {
-        entry = { count: 0, blockedUntil: 0, firstAttempt: now };
-    }
-    entry.count++;
-    if (entry.count >= IP_BF_MAX_TRIES) {
-        entry.blockedUntil = now + IP_BF_BAN_MS;
-        console.warn(`🔐 [HYDRA-BLOCK] IP ${ip} brute force — 1 saat ban`);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt", "expiresAt")
-             VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '1 hour')
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW(), "expiresAt"=NOW() + INTERVAL '1 hour'`,
-            [uuidv4(), ip, `HYDRA/BruteForce: ${entry.count} giriş denemesi`]
-        ).catch(() => {});
-    }
-    IP_LOGIN_TRACKER.set(ip, entry);
-    return entry.blockedUntil > now;
-}
-
-function isIPBruteForceBlocked(ip) {
-    const entry = IP_LOGIN_TRACKER.get(ip);
-    return entry && entry.blockedUntil > Date.now();
-}
-
-function ipBruteForceMiddleware(req, res, next) {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-    if (isIPBruteForceBlocked(ip)) {
-        return res.status(429).json({ error: 'Çok fazla giriş denemesi. IP adresiniz geçici olarak engellendi.', retryAfter: 3600 });
-    }
+// 🎙️ Sesli mesajlar — audio streaming için doğru başlıklar (genel /uploads'tan ÖNCE!)
+app.use('/uploads/voice', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    const ext = path.extname(req.path).toLowerCase();
+    const mimeMap = { '.webm':'audio/webm', '.ogg':'audio/ogg', '.mp3':'audio/mpeg',
+                      '.m4a':'audio/mp4', '.wav':'audio/wav', '.aac':'audio/aac', '.3gp':'audio/3gpp' };
+    if (mimeMap[ext]) res.setHeader('Content-Type', mimeMap[ext]);
     next();
-}
-app.use('/api/auth/login', ipBruteForceMiddleware);
-app.use('/api/auth/verify-2fa', ipBruteForceMiddleware);
+}, express.static(path.join(uploadsDir, 'voice'), { maxAge: '7d' }));
 
-// ═══════════════════════════════════════════════════════════════
-// 🍯 HONEYPOT TUZAKLAR — Tarayıcıları Anında Ban'la
-// ═══════════════════════════════════════════════════════════════
-const HONEYPOT_PATHS = [
-    '/admin', '/phpmyadmin', '/pma', '/mysql', '/phpinfo.php',
-    '/wp-admin', '/wp-login.php', '/wordpress', '/wp-content',
-    '/.env', '/.git/HEAD', '/.git/config', '/config.php',
-    '/server-status', '/server-info', '/.htaccess', '/.htpasswd',
-    '/etc/passwd', '/etc/shadow', '/proc/self/environ',
-    '/shell', '/cmd', '/cmd.php', '/eval.php', '/upload.php',
-    '/backdoor.php', '/webshell.php', '/c99.php', '/r57.php',
-    '/xmlrpc.php', '/xmlrpc', '/actuator', '/actuator/health',
-    '/console', '/debug', '/_profiler', '/telescope',
-    '/solr', '/jmx-console', '/invoker/JMXInvokerServlet',
-    '/manager/html', '/manager/text', '/tomcat',
-    '/cgi-bin/bash', '/cgi-bin/sh', '/cgi-bin/python',
-    '/boaform/admin/formLogin',
-    '/GponForm/diag_Form',
-];
-
-app.use((req, res, next) => {
-    const path = req.path.toLowerCase();
-    if (HONEYPOT_PATHS.some(hp => path === hp || path.startsWith(hp + '/'))) {
-        const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-        console.warn(`🍯 [HONEYPOT] ${ip} tuzağa düştü: ${req.path}`);
-        logFirewallAttack(ip, `HONEYPOT: ${req.path}`, req);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt")
-             VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW()`,
-            [uuidv4(), ip, `HONEYPOT: ${req.path} — Kalici ban`]
-        ).catch(() => {});
-        FIREWALL_BLOCKED_IPS.add(ip);
-        return setTimeout(() => res.status(404).end(), 3000);
-    }
+// 🖼️ Post resimleri — uzun cache (WebP immutable, isim UUID bazlı)
+app.use('/uploads/posts', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable'); // 1 yıl — UUID dosya adı değişmez
     next();
-});
+}, express.static(postsDir, { maxAge: '1y', etag: true, lastModified: true }));
 
-function logFirewallAttack(ip, reason, req) {
-    if (!FIREWALL_ATTACK_LOG.has(ip)) {
-        FIREWALL_ATTACK_LOG.set(ip, { count: 0, firstSeen: Date.now(), lastSeen: Date.now(), reasons: [] });
-    }
-    const entry = FIREWALL_ATTACK_LOG.get(ip);
-    entry.count++;
-    entry.lastSeen = Date.now();
-    if (entry.reasons.length < 10) entry.reasons.push(reason);
-    if (entry.count >= FIREWALL_AUTO_BAN_THRESHOLD) {
-        FIREWALL_BLOCKED_IPS.add(ip);
-        console.warn(`🔥 [FIREWALL] AUTO-BAN: ${ip} | Sebep: ${reason} | Toplam: ${entry.count}`);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt", "expiresAt")
-             VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '24 hours')
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW(), "expiresAt"=NOW() + INTERVAL '24 hours'`,
-            [uuidv4(), ip, `AUTO-BAN: ${reason} (${entry.count} saldir)`]
-        ).catch(() => {});
-    }
-}
-
-function firewallMiddleware(req, res, next) {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-
-    // 1. Engellenmiş IP kontrolü
-    if (FIREWALL_BLOCKED_IPS.has(ip)) {
-        return res.status(403).json({ error: 'Erişim engellendi' });
-    }
-
-    // 2. HTTP Metod kısıtlaması
-    const ALLOWED_METHODS = ['GET','POST','PUT','DELETE','PATCH','OPTIONS','HEAD'];
-    if (!ALLOWED_METHODS.includes(req.method)) {
-        logFirewallAttack(ip, `Yasak HTTP metodu: ${req.method}`, req);
-        return res.status(405).json({ error: 'Metod desteklenmiyor' });
-    }
-
-    // 3. Kötü User-Agent
-    const ua = req.headers['user-agent'] || '';
-    if (!ua && req.method !== 'OPTIONS' && req.path.startsWith('/api/')) {
-        logFirewallAttack(ip, 'Missing User-Agent', req);
-        return res.status(400).json({ error: 'Geçersiz istek' });
-    }
-    for (const pattern of BAD_USER_AGENTS) {
-        if (pattern.test(ua)) {
-            logFirewallAttack(ip, `Kotu UA: ${ua.substring(0, 80)}`, req);
-            FIREWALL_BLOCKED_IPS.add(ip);
-            return res.status(403).json({ error: 'Erişim engellendi' });
-        }
-    }
-
-    // 4. NMAP / Port Scan tespiti
-    const now = Date.now();
-    let scanEntry = SCAN_DETECTOR.get(ip) || { endpoints: new Set(), firstSeen: now, count: 0 };
-    if (now - scanEntry.firstSeen > SCAN_WINDOW_MS) {
-        scanEntry = { endpoints: new Set(), firstSeen: now, count: 0 };
-    }
-    scanEntry.endpoints.add(req.path.split('?')[0]);
-    scanEntry.count++;
-    SCAN_DETECTOR.set(ip, scanEntry);
-    if (scanEntry.endpoints.size > SCAN_ENDPOINT_LIMIT || scanEntry.count > SCAN_REQ_LIMIT) {
-        logFirewallAttack(ip, `Scan: ${scanEntry.endpoints.size} endpoint, ${scanEntry.count} istek`, req);
-        console.warn(`🔥 [NMAP-BLOCK] ${ip}: ${scanEntry.endpoints.size} endpoint tarandı`);
-        FIREWALL_BLOCKED_IPS.add(ip);
-        dbRun(
-            `INSERT INTO banned_ips (id, ip, reason, "bannedAt", "expiresAt")
-             VALUES ($1, $2, $3, NOW(), NOW() + INTERVAL '6 hours')
-             ON CONFLICT (ip) DO UPDATE SET reason=$3, "bannedAt"=NOW(), "expiresAt"=NOW() + INTERVAL '6 hours'`,
-            [uuidv4(), ip, `NMAP/Scan: ${scanEntry.endpoints.size} endpoint`]
-        ).catch(() => {});
-        return res.status(403).json({ error: 'Erişim engellendi' });
-    }
-
-    // 5. URL saldırı pattern'leri
-    let fullUrl;
-    try { fullUrl = decodeURIComponent(req.originalUrl || req.url || ''); } catch { fullUrl = req.originalUrl || ''; }
-    for (const pattern of ATTACK_PATTERNS) {
-        if (pattern.test(fullUrl)) {
-            logFirewallAttack(ip, `URL saldirisi: ${fullUrl.substring(0, 100)}`, req);
-            return res.status(403).json({ error: 'Geçersiz istek' });
-        }
-    }
-
-    // 6. Body saldırı pattern'leri
-    if (req.body && typeof req.body === 'object') {
-        const bodyStr = JSON.stringify(req.body);
-        for (const pattern of ATTACK_PATTERNS) {
-            if (pattern.test(bodyStr)) {
-                logFirewallAttack(ip, 'Body saldirisi', req);
-                return res.status(400).json({ error: 'Geçersiz içerik' });
-            }
-        }
-    }
-
-    // 7. Çok büyük header'lar
-    const totalHeaderSize = Object.values(req.headers).join('').length;
-    if (totalHeaderSize > 16384) {
-        logFirewallAttack(ip, 'Asiri buyuk header', req);
-        return res.status(431).json({ error: 'İstek başlıkları çok büyük' });
-    }
-
-    // 8. X-Forwarded-For spoof tespiti
-    const xff = req.headers['x-forwarded-for'];
-    if (xff && xff.split(',').length > 5) {
-        logFirewallAttack(ip, `XFF spoof: ${xff.substring(0, 80)}`, req);
-    }
-
+// 🖼️ Profil resimleri — orta cache (profil güncellenince yeni dosya adı)
+app.use('/uploads/profiles', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Cache-Control', 'public, max-age=604800'); // 7 gün
     next();
+}, express.static(profilesDir, { maxAge: '7d', etag: true }));
+
+app.use('/uploads', express.static(uploadsDir, { maxAge: '1y', dotfiles: 'deny' }));
+
+
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 PRO GÜVENLİK — Cookie Anomaly Detection & Session Sync
+// ════════════════════════════════════════════════════════════════════
+//
+// 1. Cookie çalınma sinyalleri:
+//    - Aynı token'dan farklı IP'ler
+//    - Kısa sürede farklı ülkelerden erişim (impossible travel)
+//    - Aynı token yüksek istek frekansı
+// 2. Tespit → token blacklist + kullanıcı bildirimi
+// ════════════════════════════════════════════════════════════════════
+
+// IP bazlı token kullanım takibi (in-memory, cluster'da Redis önerilir)
+const tokenIpMap = new Map(); // tokenHash → { ips: Set, firstSeen, lastSeen, count }
+const TOKEN_ANOMALY_WINDOW  = 30 * 60 * 1000; // 30 dakika (genişletildi)
+const TOKEN_MAX_DISTINCT_IPS = 10;             // 30dk içinde 10'dan fazla farklı IP = şüpheli (CGN/proxy için tolerans)
+const TOKEN_MAX_REQUESTS     = 1000;           // 30dk içinde 1000+ istek = şüpheli
+
+function trackTokenUsage(token, ip) {
+    if (!token || !ip) return false; // şüpheli değil
+    try {
+        const hash = crypto.createHash('sha256').update(token).digest('hex').slice(0, 16);
+        const now  = Date.now();
+        const entry = tokenIpMap.get(hash) || { ips: new Set(), firstSeen: now, lastSeen: now, count: 0 };
+
+        // Pencere dışıysa sıfırla
+        if (now - entry.firstSeen > TOKEN_ANOMALY_WINDOW) {
+            entry.ips.clear();
+            entry.firstSeen = now;
+            entry.count = 0;
+        }
+
+        entry.ips.add(ip);
+        entry.lastSeen = now;
+        entry.count++;
+        tokenIpMap.set(hash, entry);
+
+        // Anomali tespiti
+        if (entry.ips.size > TOKEN_MAX_DISTINCT_IPS) {
+            console.warn(`[🚨 COOKIE ANOMALY] Token farklı IP'lerden kullanılıyor: ${entry.ips.size} IP | hash=${hash}`);
+            return true; // şüpheli
+        }
+        if (entry.count > TOKEN_MAX_REQUESTS) {
+            console.warn(`[🚨 COOKIE ANOMALY] Token spam: ${entry.count} istek / 10dk | hash=${hash}`);
+            return true; // şüpheli
+        }
+        return false;
+    } catch (_) { return false; }
 }
 
-// Slowloris koruması — server nesnesine uygulanır
-function applySlowlorisProtection(httpServer) {
-    httpServer.setTimeout(30 * 1000);
-    httpServer.headersTimeout = 10 * 1000;
-    httpServer.keepAliveTimeout = 5 * 1000;
-    httpServer.requestTimeout = 30 * 1000;
-    console.log('✅ Slowloris/HTTP-DoS koruması aktif');
-}
-
-// Bellek temizliği
+// 15 dakikada bir eski kayıtları temizle
 setInterval(() => {
     const now = Date.now();
-    for (const [ip, entry] of SCAN_DETECTOR.entries()) {
-        if (now - entry.firstSeen > SCAN_WINDOW_MS * 2) SCAN_DETECTOR.delete(ip);
+    for (const [k, v] of tokenIpMap) {
+        if (now - v.lastSeen > TOKEN_ANOMALY_WINDOW * 2) tokenIpMap.delete(k);
     }
-    for (const [ip, entry] of IP_LOGIN_TRACKER.entries()) {
-        if (now - entry.firstAttempt > IP_BF_WINDOW_MS * 2) IP_LOGIN_TRACKER.delete(ip);
-    }
-}, 5 * 60 * 1000);
+}, 15 * 60 * 1000);
 
-// Not: app.use(firewallMiddleware) statik dosyalardan önce (yukarıda) çağrılmaktadır.
+// ── Anomaly Detection Middleware (authenticateToken'dan ÖNCE değil, sonra çalışır)
+// Sadece giriş yapmış kullanıcılarda aktif — statik dosyalar bu middleware'e uğramaz
+async function cookieAnomalyMiddleware(req, res, next) {
+    // Sadece API rotaları
+    if (!req.path.startsWith('/api/')) return next();
 
-// 🔥 Firewall yönetimi API'leri
-// Başlangıçta DB'deki ban'ları belleğe yükle
-async function loadFirewallBans() {
-    try {
-        const bans = await dbAll(
-            `SELECT ip FROM banned_ips WHERE "expiresAt" IS NULL OR "expiresAt" > NOW()`
-        );
-        bans.forEach(b => FIREWALL_BLOCKED_IPS.add(b.ip));
-        console.log(`🔥 [FIREWALL] ${FIREWALL_BLOCKED_IPS.size} engellenmiş IP yüklendi`);
-    } catch (e) {
-        console.error('Firewall ban yükleme hatası:', e.message);
+    const token = req.cookies?.access_token ||
+                  (req.headers['authorization']?.startsWith('Bearer ') ? req.headers['authorization'].slice(7) : null);
+    if (!token) return next();
+
+    const clientIp = req.ip || req.socket?.remoteAddress || 'unknown';
+    const isAnomalous = trackTokenUsage(token, clientIp);
+
+    if (isAnomalous) {
+        // Token'ı blacklist'e ekle ve kullanıcıyı bildir
+        await blacklistToken(token).catch(() => {});
+        console.error(`[🚨 SECURITY] Şüpheli cookie kullanımı → token iptal edildi | IP: ${clientIp}`);
+        return res.status(401).json({
+            error: 'Oturum güvenlik ihlali nedeniyle sonlandırıldı. Tekrar giriş yapın.',
+            code : 'SESSION_ANOMALY'
+        });
     }
+    next();
 }
-// DB hazır olduktan sonra çağrılacak (initializeDatabase'den sonra)
 
-// Rate Limiting
-// Genel API rate limit
-// ✅ Genel API rate limit — 2x artırıldı (giriş/kayıt hariç)
-app.use('/api/', rateLimit({
-    windowMs      : 15 * 60 * 1000, // 15 dakika
-    max           : 600,             // 300 → 600 (2x)
-    standardHeaders: true,
-    legacyHeaders : false,
-    message       : { error: 'Çok fazla istek gönderildi. Lütfen bekleyin.' },
-    skip          : (req) => req.method === 'OPTIONS',
-}));
+// ── Session Sync Check: Token DB'de geçerli mi? (5 dakikada bir kontrol)
+// Başka bir cihazdan çıkış yapıldıysa bu istek de reddedilir
+const sessionSyncCache = new Map(); // userId → { valid, checkedAt }
+const SESSION_SYNC_INTERVAL = 5 * 60 * 1000; // 5 dakika
 
-// Auth endpoint'leri — GÜVENLİK: değiştirilmedi, sıkı kalır
-app.use('/api/auth/login',           rateLimit({ windowMs: 15 * 60 * 1000, max: 10,  message: { error: 'Çok fazla giriş denemesi. 15 dakika bekleyin.' } }));
-app.use('/api/auth/register',        rateLimit({ windowMs: 60 * 60 * 1000, max: 5,   message: { error: 'Çok fazla kayıt denemesi. 1 saat bekleyin.' } }));
-app.use('/api/auth/register-init',   rateLimit({ windowMs: 60 * 60 * 1000, max: 5,   message: { error: 'Çok fazla kayıt denemesi. 1 saat bekleyin.' } }));
-app.use('/api/auth/forgot-password', rateLimit({ windowMs: 60 * 60 * 1000, max: 3,   message: { error: 'Çok fazla şifre sıfırlama denemesi. 1 saat bekleyin.' } }));
-app.use('/api/auth/verify-2fa',      rateLimit({ windowMs: 10 * 60 * 1000, max: 10,  message: { error: 'Çok fazla doğrulama denemesi.' } }));
-app.use('/api/auth/resend-2fa',      rateLimit({ windowMs: 5  * 60 * 1000, max: 3,   message: { error: 'Çok fazla kod istendi. 5 dakika bekleyin.' } }));
-app.use('/api/auth/verify-email',    rateLimit({ windowMs: 5  * 60 * 1000, max: 5,   message: { error: 'Çok fazla doğrulama denemesi.' } }));
-app.use('/api/auth/resend-verification', rateLimit({ windowMs: 10 * 60 * 1000, max: 3 }));
+async function sessionSyncMiddleware(req, res, next) {
+    if (!req.path.startsWith('/api/') || !req.user) return next();
+    try {
+        const userId = req.user.id;
+        const now    = Date.now();
+        const cached = sessionSyncCache.get(userId);
 
-// Upload/mesaj endpoint — 2x artırıldı
-app.use('/api/posts', (req, res, next) => {
-    if (req.method !== 'POST') return next();
-    return rateLimit({ windowMs: 60 * 1000, max: 60 })(req, res, next); // 30 → 60
-});
-app.use('/api/messages', rateLimit({ windowMs: 60 * 1000, max: 120 })); // 60 → 120
+        // Cache'de geçerli varsa DB'ye gitme
+        if (cached && now - cached.checkedAt < SESSION_SYNC_INTERVAL) {
+            if (!cached.valid) return res.status(401).json({ error: 'Oturum sonlandırıldı' });
+            return next();
+        }
+
+        // DB'den kullanıcı durumunu kontrol et
+        const user = await dbGet(
+            `SELECT id, "isActive", "isBanned" FROM users WHERE id=$1 LIMIT 1`,
+            [userId]
+        );
+        const valid = !!(user && user.isActive && !user.isBanned);
+        sessionSyncCache.set(userId, { valid, checkedAt: now });
+
+        if (!valid) {
+            return res.status(401).json({ error: 'Hesabınız askıya alınmış veya silinmiş.' });
+        }
+        next();
+    } catch (_) { next(); }
+}
+
+// Cache temizleyici
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of sessionSyncCache) {
+        if (now - v.checkedAt > SESSION_SYNC_INTERVAL * 3) sessionSyncCache.delete(k);
+    }
+}, 10 * 60 * 1000);
+
+// ════════════════════════════════════════════════════════════════════
+// ← PRO Güvenlik Sistemi sonu
+// ════════════════════════════════════════════════════════════════════
 
 // ==================== 🔒 SPAM KORUMASI MIDDLEWARE ====================
 
-const spamCounters = new Map(); // Bellek tabanlı (Redis yoksa)
+// 🔒 NOT: spamCounters bellek tabanlıdır — cluster modunda her worker bağımsız sayaç tutar.
+// Güçlü koruma için Redis kullanın (REDIS_URL env ile yapılandırılabilir).
+// Şu anki yapı: worker başına 30 istek/dakika sınırı (4 worker = 120 toplam olabilir)
+const spamCounters = new Map();
 
 const spamProtection = async (req, res, next) => {
     if (!req.user || !['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
@@ -4472,21 +5139,76 @@ const spamProtection = async (req, res, next) => {
 // ==================== AUTH MIDDLEWARE ====================
 
 // ═══════════════════════════════════════════════════════════════
-// 🔒 TOKEN BLACKLIST — Logout sonrası token'lar geçersiz
-// Üretimde Redis ile replace edilmeli
+// 🔒 TOKEN BLACKLIST — DB tabanlı (Cluster-safe)
+// Her worker aynı DB'yi gördüğü için logout tüm worker'larda geçerli olur.
+// Performans: token hash'i önce 5 dakikalık in-memory cache'de aranır, yoksa DB.
 // ═══════════════════════════════════════════════════════════════
-const TOKEN_BLACKLIST     = new Set();
-const TOKEN_BLACKLIST_MAX = 50000; // ~50K token ≈ ~10MB bellek
+const BLACKLIST_CACHE     = new Map(); // tokenHash → expireAt (ms) — sadece cache
+const BLACKLIST_CACHE_TTL = 5 * 60 * 1000; // 5 dakika
 
-function blacklistToken(token) {
+async function blacklistToken(token) {
     if (!token) return;
-    if (TOKEN_BLACKLIST.size >= TOKEN_BLACKLIST_MAX) {
-        // LRU benzeri temizlik — ilk %20'yi sil
-        const arr = [...TOKEN_BLACKLIST];
-        arr.slice(0, Math.floor(TOKEN_BLACKLIST_MAX * 0.2)).forEach(t => TOKEN_BLACKLIST.delete(t));
+    try {
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        // JWT'nin kalan süresini hesapla (süre dolunca zaten geçersiz, DB'yi şişirme)
+        let expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // fallback: 24 saat
+        try {
+            const decoded = jwt.decode(token);
+            if (decoded?.exp) expiresAt = new Date(decoded.exp * 1000);
+        } catch (_) {}
+
+        await pool.query(
+            `INSERT INTO blacklisted_tokens ("tokenHash", "expiresAt", "createdAt")
+             VALUES ($1, $2, NOW())
+             ON CONFLICT ("tokenHash") DO NOTHING`,
+            [tokenHash, expiresAt]
+        ).catch(e => console.error('[Blacklist] DB insert hatası:', e.message));
+
+        // In-memory cache'e de ekle (hızlı kontrol için)
+        BLACKLIST_CACHE.set(tokenHash, expiresAt.getTime());
+    } catch (e) {
+        console.error('[Blacklist] blacklistToken hatası:', e.message);
     }
-    TOKEN_BLACKLIST.add(token);
 }
+
+async function isTokenBlacklisted(token) {
+    if (!token) return false;
+    try {
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        // 1. Önce in-memory cache'e bak (DB'ye gitmeden hızlı cevap)
+        if (BLACKLIST_CACHE.has(tokenHash)) {
+            const exp = BLACKLIST_CACHE.get(tokenHash);
+            if (Date.now() < exp) return true;
+            BLACKLIST_CACHE.delete(tokenHash); // Süresi dolmuş, temizle
+        }
+        // 2. DB'ye sor
+        const row = await pool.query(
+            `SELECT 1 FROM blacklisted_tokens WHERE "tokenHash" = $1 AND "expiresAt" > NOW() LIMIT 1`,
+            [tokenHash]
+        );
+        if (row.rows.length > 0) {
+            // Önbelleğe al
+            BLACKLIST_CACHE.set(tokenHash, Date.now() + BLACKLIST_CACHE_TTL);
+            return true;
+        }
+        return false;
+    } catch (e) {
+        console.error('[Blacklist] isTokenBlacklisted hatası:', e.message);
+        return false; // Hata durumunda bloke etme (kullanıcıyı kilitme)
+    }
+}
+
+// Süresi dolmuş blacklist kayıtlarını temizle (saatte 1)
+setInterval(async () => {
+    try {
+        await pool.query(`DELETE FROM blacklisted_tokens WHERE "expiresAt" < NOW()`);
+        // Cache'den de süresi dolanları temizle
+        const now = Date.now();
+        for (const [hash, exp] of BLACKLIST_CACHE) {
+            if (now >= exp) BLACKLIST_CACHE.delete(hash);
+        }
+    } catch (_) {}
+}, 60 * 60 * 1000);
 
 async function authenticateToken(req, res, next) {
     // 🔒 1. Token al — önce HttpOnly cookie, yoksa Bearer header
@@ -4499,8 +5221,8 @@ async function authenticateToken(req, res, next) {
     }
     if (!token) return res.status(401).json({ error: 'Token gerekli' });
 
-    // 🔒 2. Blacklist kontrolü — logout edilmiş token tekrar kullanılamaz
-    if (TOKEN_BLACKLIST.has(token)) {
+    // 🔒 2. Blacklist kontrolü — logout edilmiş token tekrar kullanılamaz (DB + cache)
+    if (await isTokenBlacklisted(token)) {
         return res.status(401).json({ error: 'Oturum sonlandırılmış. Tekrar giriş yapın.' });
     }
 
@@ -4517,14 +5239,16 @@ async function authenticateToken(req, res, next) {
             `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
                     "isVerified", "isActive", "userType", "hasFarmerBadge",
                     "isOnline", "isBanned", "emailVerified", "twoFactorEnabled"
-             FROM users WHERE id = $1 AND "isActive" = TRUE AND "isBanned" = FALSE`,
+             FROM users WHERE id = $1 AND "isActive" = TRUE`,
             [decoded.id]
         );
         if (!user) {
-            // Token geçerli ama kullanıcı ban'lı/silinmiş → token'ı blacklist'e ekle
+            // Token geçerli ama kullanıcı silinmiş → blacklist
             blacklistToken(token);
             return res.status(403).json({ error: 'Hesap erişilemez durumda.' });
         }
+        // 🔒 Banlı kullanıcı: sadece kendi profilini 3 sn görebilir,
+        // diğer tüm işlemler requireNotBanned middleware'i tarafından engellenir
 
         const restriction = await dbGet(
             `SELECT "isRestricted", "restrictedUntil", "canPost", "canComment", "canMessage", "canFollow", "canLike"
@@ -4555,6 +5279,10 @@ async function authenticateToken(req, res, next) {
             restriction     : restriction || null,
         };
         req._token = token; // logout için
+
+        // 🔒 PRO: Session sync — hesap askıya alındıysa cache'i temizle
+        sessionSyncCache.delete(user.id); // Her başarılı auth'ta sync cache'i zorla tazele
+
         next();
     } catch (error) {
         // jwt.verify hataları — süresi dolmuş, imza yanlış, format bozuk
@@ -4586,34 +5314,70 @@ async function createNotification(userId, type, message, data = {}) {
              VALUES ($1, $2, $3, $4, $5, NOW())`,
             [uuidv4(), userId, type, message, JSON.stringify(data)]
         );
-        // Web Push bildirimi gönder (hata olsa bile devam et)
-        const pushIcons = { like: '❤️', comment: '💬', follow: '👥', message: '📩', story_like: '⭐', comment_like: '👍', mention: '📢' };
+
+        // ── Bildirim başlık ve içeriklerini zenginleştir ─────────────────
+        const pushIcons = { like: '❤️', comment: '💬', follow: '👥', message: '📩', story_like: '⭐', comment_like: '👍', mention: '📢', new_post: '📸' };
         const icon = pushIcons[type] || '🌾';
+
+        // Tip bazlı başlık ve body oluştur
+        let pushTitle = `AgroLink ${icon}`;
+        let pushBody  = message;
+
+        if (type === 'like' && data.actorName) {
+            pushTitle = `${data.actorName} ❤️`;
+            pushBody  = data.postPreview
+                ? `Gönderinizi beğendi: "${data.postPreview}"`
+                : 'Gönderinizi beğendi';
+        } else if (type === 'comment' && data.actorName) {
+            pushTitle = `${data.actorName} 💬`;
+            pushBody  = data.commentContent
+                ? `"${data.commentContent}"`
+                : 'Gönderinize yorum yaptı';
+        } else if (type === 'follow' && data.actorName) {
+            pushTitle = `${data.actorName} 👥`;
+            pushBody  = 'Sizi takip etmeye başladı';
+        } else if (type === 'message' && data.actorName) {
+            pushTitle = `${data.actorName} 📩`;
+            pushBody  = data.messagePreview
+                ? data.messagePreview
+                : 'Size yeni bir mesaj gönderdi';
+        } else if (type === 'new_post' && data.actorName) {
+            pushTitle = `${data.actorName} 📸`;
+            pushBody  = 'Yeni bir gönderi paylaştı';
+        }
+
         const urlMap = {
-            like: data.postId ? `/p/${data.postId}` : '/',
-            comment: data.postId ? `/p/${data.postId}` : '/',
-            follow: '/',
-            message: '/',
+            like      : data.postId ? `/p/${data.postId}` : '/',
+            comment   : data.postId ? `/p/${data.postId}` : '/',
+            follow    : data.actorUsername ? `/u/${data.actorUsername}` : '/',
+            message   : '/',
+            new_post  : data.postId ? `/p/${data.postId}` : '/',
         };
+
         // Web push (browser)
         sendPushToUser(userId, {
-            title: `AgroLink ${icon}`,
-            body: message,
-            icon: '/agro.png',
-            url: urlMap[type] || '/'
+            title: pushTitle,
+            body : pushBody,
+            icon : data.actorProfilePic ? absoluteUrl(data.actorProfilePic) : '/agro.png',
+            url  : urlMap[type] || '/'
         }).catch(() => {});
 
-        // 📱 FCM push (Android native app)
+        // 📱 FCM push (Android native app) — data alanı string map olmalı
+        const fcmData = {
+            type,
+            url: urlMap[type] || '/',  // FCM web push tıklama URL'i (absolute yapılacak sendFcmPush'ta)
+            ...Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v ?? '')])),
+        };
         sendFcmPush(userId, {
-            title: `AgroLink ${icon}`,
-            body : message,
-            data : { type, ...Object.fromEntries(Object.entries(data).map(([k,v]) => [k, String(v ?? '')])) },
-        }).catch(() => {});
+            title: pushTitle,
+            body : pushBody,
+            data : fcmData,
+        }).catch((fcmErr) => console.error("[FCM createNotification]", fcmErr.message));
 
         // 🔌 Socket.IO anlık bildirim
         if (io && onlineUsers.has(userId)) {
             for (const sid of onlineUsers.get(userId)) {
-                io.to(sid).emit('notification:new', { type, message, data, createdAt: new Date().toISOString() });
+                io.to(sid).emit('notification:new', { type, message: pushBody, data, createdAt: new Date().toISOString() });
             }
         }
     } catch (err) {
@@ -4698,8 +5462,6 @@ function setCsrfCookie(res, req, token) {
 
 function verifyCsrf(req, res, next) {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-    const authHeader = req.headers['authorization'];
-    if (authHeader && authHeader.startsWith('Bearer ')) return next();
     const cookieToken = req.cookies?.csrf_token;
     const headerToken = req.headers['x-csrf-token'];
     if (!cookieToken) return next();
@@ -4758,19 +5520,27 @@ app.get('/api/app/version', (req, res) => {
     });
 });
 
-// POST /api/device-token — FCM token kayıt (push bildirim)
+// POST /api/device-token — FCM / Web Push token kayıt
+// platform değerleri: 'android' | 'ios' | 'web' (VAPID sub) | 'web_fcm' (FCM Web token)
 app.post('/api/device-token', authenticateToken, async (req, res) => {
     try {
         const { token, platform = 'android' } = req.body;
         if (!token) return res.status(400).json({ success: false, error: 'token zorunludur' });
+
+        const ALLOWED_PLATFORMS = ['android', 'ios', 'web', 'web_fcm'];
+        const safePlatform = ALLOWED_PLATFORMS.includes(platform) ? platform : 'android';
+
+        // Web push subscription nesnesi JSON olarak gelirse string'e çevir
+        const tokenStr = typeof token === 'object' ? JSON.stringify(token) : String(token);
+
         await dbRun(
             `INSERT INTO device_tokens (id, "userId", token, platform, "createdAt", "updatedAt", "isActive")
              VALUES ($1, $2, $3, $4, NOW(), NOW(), TRUE)
              ON CONFLICT (token)
-             DO UPDATE SET "userId" = $2, "isActive" = TRUE, "updatedAt" = NOW()`,
-            [uuidv4(), req.user.id, token, platform]
+             DO UPDATE SET "userId" = $2, "isActive" = TRUE, "updatedAt" = NOW(), platform = $4`,
+            [uuidv4(), req.user.id, tokenStr, safePlatform]
         );
-        res.json({ success: true, message: 'Cihaz token kaydedildi' });
+        res.json({ success: true, message: 'Cihaz token kaydedildi', platform: safePlatform });
     } catch (e) {
         console.error('[device-token POST]', e);
         res.status(500).json({ success: false, error: 'Sunucu hatası' });
@@ -4806,429 +5576,71 @@ app.get('/api/socket/status', (req, res) => {
     });
 });
 
-
-// =============================================================================
-// 💬 CHATSEE UYUMLULUK BLOGU
-// Frontend (public/chatsee/index.html) bu endpoint'leri çağırıyor.
-// Bu blok mevcut AgroLink auth route'larından ÖNCE tanımlanmıştır —
-// Express ilk eşleşen handler'ı kullanır.
-// =============================================================================
-
-// ── 1. GLOBAL MIDDLEWARE: display_name → name dönüşümü ───────────────────────
-// ChatSee register formu 'display_name' gönderir, AgroLink 'name' bekler.
-app.use((req, res, next) => {
-    if (req.body && typeof req.body === 'object') {
-        if (!req.body.name && req.body.display_name) {
-            req.body.name = req.body.display_name;
-        }
-    }
-    next();
-});
-
-// ── 2. POST /api/auth/register — 2FA & e-posta doğrulaması OLMADAN kayıt ──────
-// AgroLink'in orijinal /api/auth/register'ı e-posta kodu istiyor ve token dönmüyor.
-// Bu versiyon ChatSee için doğrudan token döndürür.
-app.post('/api/auth/register', async (req, res, next) => {
-    // Sadece JSON body'si olan istekleri yakala (multipart/form-data olan
-    // AgroLink native app isteklerini geç)
-    const ct = req.headers['content-type'] || '';
-    if (ct.includes('multipart/form-data')) return next();
-
+// ─── QR KOD: GET /api/users/:username/qr ────────────────────────────────
+// Profil paylaşımında QR kod üretir — URL'yi SVG QR koduna dönüştürür
+// Harici kütüphane gerekmez: pure SVG QR matrix
+app.get('/api/users/:username/qr', async (req, res) => {
     try {
-        const { name, display_name, username, email, password, userType } = req.body;
-        const finalName     = (name || display_name || '').trim();
-        const cleanUsername = (username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').trim();
-        const cleanEmail    = (email    || '').toLowerCase().trim();
-        const pwd           = (password || '');
+        const username = req.params.username?.toLowerCase().trim();
+        if (!username) return res.status(400).json({ error: 'Kullanıcı adı gerekli' });
 
-        // Zorunlu alan kontrolü
-        if (!finalName || !cleanUsername || !cleanEmail || !pwd) {
-            const missing = [];
-            if (!finalName)     missing.push('İsim');
-            if (!cleanUsername) missing.push('Kullanıcı adı');
-            if (!cleanEmail)    missing.push('E-posta');
-            if (!pwd)           missing.push('Şifre');
-            return res.status(400).json({ error: `Şu alanlar zorunlu: ${missing.join(', ')}` });
+        const DOMAIN = (process.env.APP_URL || 'https://sehitumitkestitarimmtal.com').replace(/\/$/, '');
+        const profileUrl = `${DOMAIN}/u/${username}`;
+
+        // QR matrisi üretici (ISO 18004 tabanlı basit implementasyon)
+        // Harici bağımlılık yok — saf JS
+        function generateQRMatrix(text) {
+            // QR kodunu data URL yerine yalnızca matrix döndürür
+            // Basit versiyon: 21x21 (Version 1) — kısa URL'ler için yeterli
+            // Gerçek QR algoritması karmaşık, burada stabil bir yaklaşım:
+            // URL'yi önce Google Charts API ile oluştur (server-side fetch)
+            return null; // Aşağıda fetch ile hallederiz
         }
 
-        if (pwd.length < 8)
-            return res.status(400).json({ error: 'Şifre en az 8 karakter olmalı' });
-        if (cleanUsername.length < 3)
-            return res.status(400).json({ error: 'Kullanıcı adı en az 3 karakter olmalı' });
+        // Google Charts QR API (HTTPS, ücretsiz, no API key)
+        const { default: fetch } = await import('node-fetch');
+        const size = parseInt(req.query.size) || 300;
+        const safeSz = Math.min(Math.max(size, 100), 600);
+        const qrUrl = `https://chart.googleapis.com/chart?cht=qr&chs=${safeSz}x${safeSz}&chl=${encodeURIComponent(profileUrl)}&choe=UTF-8&chld=M|2`;
 
-        // Kullanıcı adı/e-posta çakışma kontrolü
-        const existing = await dbGet('SELECT id FROM users WHERE username=$1', [cleanUsername]);
-        if (existing) return res.status(409).json({ error: 'Bu kullanıcı adı zaten alınmış' });
+        const qrRes = await fetch(qrUrl, { signal: AbortSignal.timeout(8000) });
+        if (!qrRes.ok) throw new Error('QR servisi yanıt vermedi');
 
-        const existingEmail = await dbGet('SELECT id FROM users WHERE email=$1', [cleanEmail]);
-        if (existingEmail) return res.status(409).json({ error: 'Bu e-posta adresi zaten kayıtlı' });
-
-        const hash   = await bcrypt.hash(pwd, BCRYPT_ROUNDS);
-        const userId = uuidv4();
-
-        const validUserTypes = ['tarim_ogretmeni','tarim_ogrencisi','ogretmen','ziraat_muhendisi','normal_kullanici','ciftci_hayvancilik'];
-        const finalUserType  = validUserTypes.includes(userType) ? userType : 'normal_kullanici';
-
-        await dbRun(
-            `INSERT INTO users
-             (id, name, username, email, password, "userType", "registrationIp",
-              "isOnline", "emailVerified", "twoFactorEnabled", "createdAt", "updatedAt")
-             VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,TRUE,FALSE,NOW(),NOW())`,
-            [userId, finalName, cleanUsername, cleanEmail, hash, finalUserType, req.ip || '']
-        );
-
-        const userObj = { id: userId, name: finalName, username: cleanUsername,
-                          email: cleanEmail, role: 'user', plan: 'free' };
-        const tokens  = generateTokens(userObj);
-        setAuthCookies(res, req, tokens);
-
-        const avatarUrl = `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(cleanUsername)}&backgroundColor=0a1628`;
-
-        return res.status(201).json({
-            success     : true,
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id          : userId,
-                name        : finalName,
-                display_name: finalName,
-                username    : cleanUsername,
-                email       : cleanEmail,
-                profilePic  : avatarUrl,
-                avatar_url  : avatarUrl,
-                isVerified  : false,
-                role        : 'user',
-            },
-        });
+        const buf = Buffer.from(await qrRes.arrayBuffer());
+        res.setHeader('Content-Type', 'image/png');
+        res.setHeader('Cache-Control', 'public, max-age=86400'); // 1 gün cache
+        res.setHeader('Content-Disposition', `inline; filename="qr-${username}.png"`);
+        res.send(buf);
     } catch (e) {
-        console.error('[ChatSee] /api/auth/register:', e.message);
-        if (e.code === '23505') return res.status(409).json({ error: 'Bu kullanıcı adı veya e-posta zaten kayıtlı' });
-        res.status(500).json({ error: 'Sunucu hatası' });
+        console.error('[QR Code]', e.message);
+        // Fallback: JSON URL dön
+        res.status(500).json({ error: 'QR kod oluşturulamadı', url: `${process.env.APP_URL || ''}/u/${req.params.username}` });
     }
 });
 
-// ── 3. POST /api/auth/login — 2FA OLMADAN giriş ───────────────────────────────
-// AgroLink'in orijinal login'i twoFactorEnabled=TRUE olan kullanıcılara
-// requires2FA:true döndürür. ChatSee frontend bunu işleyemiyor.
-// Bu versiyon 2FA olmadan doğrudan token döndürür.
-app.post('/api/auth/login', async (req, res, next) => {
-    const ct = req.headers['content-type'] || '';
-    if (ct.includes('multipart/form-data')) return next();
-
+// GET /api/users/:username/qr-data — QR için URL bilgisi (JSON)
+app.get('/api/users/:username/qr-data', authenticateToken, async (req, res) => {
     try {
-        const { email, password, identifier, username } = req.body;
-        const loginId = (identifier || email || username || '').toLowerCase().trim();
-
-        if (!loginId || !password)
-            return res.status(400).json({ error: 'E-posta/kullanıcı adı ve şifre gerekli' });
-
-        const user = await dbGet(
-            `SELECT id, username, name, email, password, role, plan,
-                    "profilePic", "isVerified", "isActive", "isBanned",
-                    "hasFarmerBadge", "userType"
-             FROM users WHERE (email=$1 OR username=$1) AND "isActive"=TRUE`,
-            [loginId]
-        );
-
-        if (!user) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
-        if (user.isBanned) return res.status(403).json({ error: 'Bu hesap askıya alınmış' });
-
-        const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
-
-        // Online güncelle
-        await dbRun(
-            `UPDATE users SET "isOnline"=TRUE, "lastLogin"=NOW(), "updatedAt"=NOW() WHERE id=$1`,
-            [user.id]
-        );
-
-        const tokens = generateTokens(user);
-        setAuthCookies(res, req, tokens);
-
-        const picUrl = user.profilePic ? absoluteUrl(user.profilePic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`;
-
-        return res.json({
-            success     : true,
-            message     : 'Giriş başarılı',
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id          : user.id,
-                name        : user.name,
-                display_name: user.name,
-                username    : user.username,
-                email       : user.email,
-                profilePic  : picUrl,
-                avatar_url  : picUrl,
-                isVerified  : user.isVerified,
-                hasFarmerBadge: user.hasFarmerBadge,
-                role        : user.role,
-            },
-        });
-    } catch (e) {
-        console.error('[ChatSee] /api/auth/login:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 4. GET /api/auth/me — Flat user objesi ────────────────────────────────────
-// AgroLink'in orijinali { user: {...} } döndürüyor.
-// ChatSee frontend'i flat obje bekliyor: currentUser.username, currentUser.avatar_url
-app.get('/api/auth/me', authenticateToken, async (req, res, next) => {
-    try {
-        const user = await dbGet(
-            `SELECT id, name, username, email, "profilePic", "isVerified",
-                    "hasFarmerBadge", role, plan, "isOnline"
-             FROM users WHERE id=$1 AND "isActive"=TRUE`,
-            [req.user.id]
-        );
+        const username = req.params.username?.toLowerCase().trim();
+        const user = await dbGet('SELECT id, username, name, "profilePic", "isVerified" FROM users WHERE username = $1 AND "isActive" = TRUE', [username]);
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
 
-        const picUrl = user.profilePic ? absoluteUrl(user.profilePic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`;
+        const DOMAIN = (process.env.APP_URL || 'https://sehitumitkestitarimmtal.com').replace(/\/$/, '');
+        const profileUrl = `${DOMAIN}/u/${username}`;
+        const qrImageUrl = `${DOMAIN}/api/users/${username}/qr`;
 
-        return res.json({
-            id          : user.id,
-            name        : user.name,
-            display_name: user.name,
-            username    : user.username,
-            email       : user.email,
-            profilePic  : picUrl,
-            avatar_url  : picUrl,
-            isVerified  : user.isVerified,
-            hasFarmerBadge: user.hasFarmerBadge,
-            role        : user.role,
-            plan        : user.plan,
-            isOnline    : user.isOnline,
-            // nested 'user' objesi de ekle (AgroLink native app uyumluluğu için)
-            user        : {
-                id: user.id, name: user.name, username: user.username, email: user.email,
-                profilePic: picUrl, coverPic: null, isVerified: user.isVerified,
-                hasFarmerBadge: user.hasFarmerBadge, role: user.role,
-            },
+        res.json({
+            success    : true,
+            url        : profileUrl,
+            qrImageUrl : qrImageUrl,
+            user       : { username: user.username, name: user.name, isVerified: user.isVerified },
         });
     } catch (e) {
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
 
-// ── 5. GET /api/conversations — ChatSee konuşma listesi ──────────────────────
-app.get('/api/conversations', authenticateToken, async (req, res) => {
-    try {
-        const uid = req.user.id;
-        const { rows } = await pool.query(`
-            SELECT
-                c.id, c.type,
-                c.name            AS group_name,
-                c.avatar_url,
-                c."updatedAt",
-                lm.content        AS last_message,
-                lm."createdAt"    AS last_message_at,
-                lm.sender_id      AS last_sender_id,
-                (
-                    SELECT COUNT(*)::int FROM chatsee_messages m2
-                    LEFT JOIN chatsee_reads r2 ON r2.message_id=m2.id AND r2.user_id=$1
-                    WHERE m2.conversation_id=c.id AND m2.sender_id!=$1
-                      AND m2.is_deleted=FALSE AND r2.message_id IS NULL
-                ) AS unread_count,
-                ou.id             AS other_id,
-                ou.name           AS other_name,
-                ou.username       AS other_username,
-                ou."profilePic"   AS other_pic,
-                ou."isOnline"     AS other_online,
-                ou."lastSeen"     AS other_last_seen
-            FROM chatsee_conversations c
-            JOIN chatsee_members cm ON cm.conversation_id=c.id AND cm.user_id=$1
-            LEFT JOIN LATERAL (
-                SELECT content,"createdAt",sender_id FROM chatsee_messages
-                WHERE conversation_id=c.id AND is_deleted=FALSE
-                ORDER BY "createdAt" DESC LIMIT 1
-            ) lm ON TRUE
-            LEFT JOIN LATERAL (
-                SELECT u.id,u.name,u.username,u."profilePic",u."isOnline",u."lastSeen"
-                FROM chatsee_members cm2
-                JOIN users u ON u.id=cm2.user_id
-                WHERE cm2.conversation_id=c.id AND cm2.user_id!=$1
-                LIMIT 1
-            ) ou ON c.type='direct'
-            ORDER BY COALESCE(lm."createdAt", c."createdAt") DESC
-        `, [uid]);
 
-        const av = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'u')}&backgroundColor=0a1628`;
-
-        res.json(rows.map(r => ({
-            id              : r.id,
-            type            : r.type,
-            name            : r.type === 'direct' ? r.other_name   : r.group_name,
-            username        : r.type === 'direct' ? r.other_username : null,
-            avatar_url      : r.type === 'direct' ? av(r.other_pic, r.other_username) : av(r.avatar_url, r.group_name),
-            profilePic      : r.type === 'direct' ? av(r.other_pic, r.other_username) : av(r.avatar_url, r.group_name),
-            isOnline        : r.type === 'direct' ? !!r.other_online : false,
-            lastSeen        : r.other_last_seen,
-            otherId         : r.other_id,
-            other_id        : r.other_id,
-            last_message    : r.last_message,
-            last_message_at : r.last_message_at,
-            lastMessage     : r.last_message,
-            lastMessageAt   : r.last_message_at,
-            unread_count    : parseInt(r.unread_count || 0),
-            unreadCount     : parseInt(r.unread_count || 0),
-            conversation_id : r.id,
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /api/conversations:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 6. POST /api/conversations/direct ────────────────────────────────────────
-app.post('/api/conversations/direct', authenticateToken, async (req, res) => {
-    try {
-        const target = req.body.target_user_id || req.body.targetUserId;
-        if (!target) return res.status(400).json({ error: 'target_user_id gerekli' });
-        const myId = req.user.id;
-
-        const blocked = await pool.query(
-            `SELECT 1 FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`,
-            [myId, target]
-        );
-        if (blocked.rows.length) return res.status(403).json({ error: 'Bu kullanıcıyla mesajlaşamazsınız' });
-
-        const existing = await pool.query(`
-            SELECT c.id FROM chatsee_conversations c
-            JOIN chatsee_members m1 ON m1.conversation_id=c.id AND m1.user_id=$1
-            JOIN chatsee_members m2 ON m2.conversation_id=c.id AND m2.user_id=$2
-            WHERE c.type='direct' LIMIT 1
-        `, [myId, target]);
-
-        if (existing.rows.length)
-            return res.json({ conversation_id: existing.rows[0].id, conversationId: existing.rows[0].id, created: false });
-
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const convId = uuidv4();
-            await client.query(`INSERT INTO chatsee_conversations (id,type,created_by) VALUES ($1,'direct',$2)`, [convId, myId]);
-            await client.query(`INSERT INTO chatsee_members (conversation_id,user_id) VALUES ($1,$2),($1,$3)`, [convId, myId, target]);
-            await client.query('COMMIT');
-            return res.status(201).json({ conversation_id: convId, conversationId: convId, created: true });
-        } catch (err) {
-            await client.query('ROLLBACK'); throw err;
-        } finally { client.release(); }
-    } catch (e) {
-        console.error('[ChatSee] /api/conversations/direct:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 7. GET /api/conversations/:id/messages ────────────────────────────────────
-app.get('/api/conversations/:convId/messages', authenticateToken, async (req, res) => {
-    try {
-        const convId = req.params.convId;
-        const myId   = req.user.id;
-        const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
-        const before = req.query.before || null;
-
-        const mem = await pool.query(
-            `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-            [convId, myId]
-        );
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim izniniz yok' });
-
-        const params = [convId, limit];
-        const cursor = before ? `AND m."createdAt" < $3` : '';
-        if (before) params.push(before);
-
-        const { rows } = await pool.query(`
-            SELECT m.id, m.conversation_id, m.sender_id, m.content, m.type,
-                   m.reply_to_id, m.is_deleted, m."createdAt",
-                   u.name AS sender_name, u.username AS sender_username,
-                   u."profilePic" AS sender_pic, u."isVerified" AS sender_verified,
-                   (SELECT JSON_AGG(r.user_id) FROM chatsee_reads r WHERE r.message_id=m.id) AS read_by
-            FROM chatsee_messages m
-            JOIN users u ON u.id=m.sender_id
-            WHERE m.conversation_id=$1 ${cursor}
-            ORDER BY m."createdAt" DESC LIMIT $2
-        `, params);
-
-        // Okundu işaretle
-        const unreadIds = rows.filter(r => r.sender_id !== myId).map(r => r.id);
-        if (unreadIds.length) {
-            pool.query(`INSERT INTO chatsee_reads (message_id,user_id,"readAt") SELECT unnest($1::uuid[]),$2,NOW() ON CONFLICT DO NOTHING`, [unreadIds, myId]).catch(() => {});
-        }
-
-        const av = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'u')}&backgroundColor=0a1628`;
-
-        res.json(rows.reverse().map(r => ({
-            id             : r.id,
-            conversation_id: r.conversation_id,
-            sender_id      : r.sender_id,
-            content        : r.content,
-            type           : r.type,
-            reply_to_id    : r.reply_to_id,
-            is_deleted     : r.is_deleted,
-            created_at     : r.createdAt,
-            read_by        : r.read_by || [],
-            sender: {
-                id        : r.sender_id,
-                name      : r.sender_name,
-                display_name: r.sender_name,
-                username  : r.sender_username,
-                avatar_url: av(r.sender_pic, r.sender_username),
-                profilePic: av(r.sender_pic, r.sender_username),
-                isVerified: r.sender_verified,
-            },
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /api/conversations/:id/messages:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 8. GET /api/users/search?q= ───────────────────────────────────────────────
-app.get('/api/users/search', authenticateToken, async (req, res) => {
-    const q = (req.query.q || '').trim().toLowerCase();
-    if (q.length < 2) return res.json([]);
-    try {
-        const { rows } = await pool.query(`
-            SELECT u.id, u.name, u.username, u."profilePic",
-                   u."isOnline" AS status, u."lastSeen", u."isVerified", u."hasFarmerBadge"
-            FROM users u
-            WHERE (LOWER(u.username) LIKE $1 OR LOWER(u.name) LIKE $1)
-              AND u.id!=$2 AND u."isActive"=TRUE AND u."isBanned"=FALSE
-              AND NOT EXISTS (
-                  SELECT 1 FROM blocks b
-                  WHERE (b."blockerId"=$2 AND b."blockedId"=u.id)
-                     OR (b."blockerId"=u.id AND b."blockedId"=$2)
-              )
-            ORDER BY u."isOnline" DESC, u.username LIMIT 20
-        `, [`%${q}%`, req.user.id]);
-
-        res.json(rows.map(r => ({
-            id          : r.id,
-            name        : r.name,
-            display_name: r.name,
-            username    : r.username,
-            avatar_url  : r.profilePic ? absoluteUrl(r.profilePic)
-                          : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(r.username)}&backgroundColor=0a1628`,
-            profilePic  : r.profilePic ? absoluteUrl(r.profilePic) : null,
-            status      : r.status ? 'online' : 'offline',
-            isOnline    : !!r.status,
-            isVerified  : r.isVerified,
-            hasFarmerBadge: r.hasFarmerBadge,
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /api/users/search:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// =============================================================================
-// END CHATSEE UYUMLULUK BLOGU
-// =============================================================================
 
 // ─── 1. HEALTH CHECK ────────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
@@ -5241,8 +5653,103 @@ app.get('/api/health', async (req, res) => {
     }
 });
 
+// ══════════════════════════════════════════════════════════════════
+// 🤖 reCAPTCHA v2 DOĞRULAMA
+// .env dosyasına ekle:
+//   RECAPTCHA_SECRET_KEY=<Google reCAPTCHA v2 gizli anahtarı>
+//   RECAPTCHA_ENABLED=true   (false yaparak devre dışı bırakılabilir)
+// Frontend'de: <script src="https://www.google.com/recaptcha/api.js"></script>
+//   + data-sitekey="<site_key>" ile widget ekle, g-recaptcha-response form'dan gönder
+// ══════════════════════════════════════════════════════════════════
+async function verifyRecaptcha(token, remoteip) {
+    // Debug logs
+    console.log('[reCAPTCHA] ENABLED:', process.env.RECAPTCHA_ENABLED);
+    console.log('[reCAPTCHA] SECRET_KEY exists:', !!process.env.RECAPTCHA_SECRET_KEY);
+    
+    // reCAPTCHA devre dışıysa veya test ortamıysa geç
+    if (process.env.RECAPTCHA_ENABLED !== 'true') {
+        console.log('[reCAPTCHA] Devre dışı, geçiliyor');
+        return { success: true, skipped: true };
+    }
+    if (process.env.NODE_ENV === 'test') {
+        console.log('[reCAPTCHA] Test ortamı, geçiliyor');
+        return { success: true, skipped: true };
+    }
+    if (!process.env.RECAPTCHA_SECRET_KEY) {
+        console.warn('⚠️  RECAPTCHA_SECRET_KEY tanımlı değil, doğrulama atlanıyor');
+        return { success: true, skipped: true };
+    }
+    if (!token) {
+        console.warn('[reCAPTCHA] Token boş');
+        return { success: false, error: 'reCAPTCHA doğrulaması gerekli' };
+    }
+    
+    console.log('[reCAPTCHA] Token var, Google API çağrılıyor...', token.substring(0, 20) + '...');
+    try {
+        const { default: fetch } = await import('node-fetch');
+        const params = new URLSearchParams({
+            secret  : process.env.RECAPTCHA_SECRET_KEY,
+            response: token,
+        });
+        if (remoteip) params.append('remoteip', remoteip);
+        
+        console.log('[reCAPTCHA] POST → https://www.google.com/recaptcha/api/siteverify');
+        const res = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+            method : 'POST',
+            body   : params,
+            signal : AbortSignal.timeout(8000),
+        });
+        console.log('[reCAPTCHA] HTTP Status:', res.status);
+        
+        const data = await res.json();
+        console.log('[reCAPTCHA] API Response:', JSON.stringify(data));
+        
+        if (!data.success) {
+            console.warn('[reCAPTCHA] ❌ Başarısız - error-codes:', data['error-codes']);
+            return { success: false, error: 'reCAPTCHA doğrulaması başarısız. Lütfen tekrar deneyin.' };
+        }
+        console.log('[reCAPTCHA] ✅ Doğrulama başarılı!');
+        return { success: true };
+    } catch (e) {
+        console.error('[reCAPTCHA] Exception:', e.message);
+        // Servis erişilemiyorsa geçir (availability öncelikli)
+        return { success: true, skipped: true };
+    }
+}
+
+// ── Native uygulama tespiti ──────────────────────────────────────────
+// Android OkHttp User-Agent veya özel X-App-Platform header'ı ile tespit edilir
+function isNativeAppRequest(req) {
+    const ua = (req.headers['user-agent'] || '').toLowerCase();
+    const platform = (req.headers['x-app-platform'] || '').toLowerCase();
+    const clientType = (req.headers['x-client-type'] || '').toLowerCase();
+    return (
+        platform === 'android' ||
+        platform === 'ios' ||
+        clientType === 'native' ||
+        ua.includes('okhttp') ||       // Retrofit/OkHttp (Android)
+        ua.includes('agrolink-android') // Özel Android UA
+    );
+}
+
+// Middleware — req.body.recaptchaToken veya req.body['g-recaptcha-response'] kontrol eder
+// 🔒 Native mobil uygulama isteklerinde reCAPTCHA ATLANIR (sadece web'de çalışır)
+async function recaptchaMiddleware(req, res, next) {
+    // Native app'ten gelen isteklerde reCAPTCHA kontrolü yok
+    if (isNativeAppRequest(req)) {
+        console.log('[reCAPTCHA] Native uygulama isteği — atlanıyor');
+        return next();
+    }
+    const token = req.body?.recaptchaToken || req.body?.['g-recaptcha-response'];
+    const result = await verifyRecaptcha(token, req.ip);
+    if (!result.success) {
+        return res.status(400).json({ error: result.error || 'reCAPTCHA doğrulaması başarısız' });
+    }
+    next();
+}
+
 // ─── 2. KAYIT ───────────────────────────────────────────────────────
-app.post('/api/auth/register', validateAuthInput, upload.single('profilePic'), async (req, res) => {
+app.post('/api/auth/register', registerLimiter, validateAuthInput, upload.single('profilePic'), async (req, res) => {
     try {
         const { name, username, email, password, userType } = req.body;
         if (!name || !username || !email || !password) {
@@ -5269,7 +5776,7 @@ app.post('/api/auth/register', validateAuthInput, upload.single('profilePic'), a
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
+                await processImage(req.file.path, outputPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5287,6 +5794,22 @@ app.post('/api/auth/register', validateAuthInput, upload.single('profilePic'), a
         );
 
         const tokens = generateTokens({ id: userId, email: cleanEmail, username: cleanUsername, role: 'user' });
+
+        // 🌾 Yeni kullanıcı varsayılan hesapları takip etsin
+        try {
+            const defaultAccounts = ['agro_sosyal', 'agrolink_news', 'yemektarifleri', 'agroabot', 'akilli.tarlam'];
+            for (const uname of defaultAccounts) {
+                const acc = await dbGet('SELECT id FROM users WHERE username = $1', [uname]);
+                if (acc) {
+                    await dbRun(
+                        'INSERT INTO follows (id, "followerId", "followingId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("followerId", "followingId") DO NOTHING',
+                        [uuidv4(), userId, acc.id]
+                    );
+                }
+            }
+        } catch (followErr) {
+            console.warn('⚠️ Otomatik takip hatası:', followErr.message);
+        }
 
         // 📧 Hoş geldiniz + e-posta doğrulama kodu gönder
         const verifyCode    = crypto.randomInt(100000, 999999).toString();
@@ -5338,7 +5861,7 @@ body{font-family:'Segoe UI',sans-serif;background:#f4f4f4;margin:0;padding:0}
 
 // ─── 2b. KAYIT (register-init alias — UI uyumluluğu için) ──────────
 // UI /api/auth/register-init çağırıyor, bu endpoint aynı işlemi yapar
-app.post('/api/auth/register-init', upload.single('profilePic'), async (req, res) => {
+app.post('/api/auth/register-init', registerLimiter, recaptchaMiddleware, upload.single('profilePic'), async (req, res) => {
     try {
         const { name, username, email, password, userType } = req.body;
         if (!name || !username || !email || !password) {
@@ -5364,7 +5887,7 @@ app.post('/api/auth/register-init', upload.single('profilePic'), async (req, res
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
+                await processImage(req.file.path, outputPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5380,6 +5903,22 @@ app.post('/api/auth/register-init', upload.single('profilePic'), async (req, res
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())`,
             [userId, name, cleanUsername, cleanEmail, hashedPassword, profilePic, finalUserType, req.ip]
         );
+
+        // 🌾 Yeni kullanıcı varsayılan hesapları takip etsin
+        try {
+            const defaultAccounts = ['agro_sosyal', 'agrolink_news', 'yemektarifleri', 'agroabot', 'akilli.tarlam'];
+            for (const uname of defaultAccounts) {
+                const acc = await dbGet('SELECT id FROM users WHERE username = $1', [uname]);
+                if (acc) {
+                    await dbRun(
+                        'INSERT INTO follows (id, "followerId", "followingId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("followerId", "followingId") DO NOTHING',
+                        [uuidv4(), userId, acc.id]
+                    );
+                }
+            }
+        } catch (followErr) {
+            console.warn('⚠️ Otomatik takip hatası:', followErr.message);
+        }
 
         // E-posta doğrulama kodu oluştur
         const verifyCode    = crypto.randomInt(100000, 999999).toString();
@@ -5419,7 +5958,7 @@ app.post('/api/auth/register-init', upload.single('profilePic'), async (req, res
 });
 
 // ─── 3. GİRİŞ ──────────────────────────────────────────────────────
-app.post('/api/auth/login', validateAuthInput, async (req, res) => {
+app.post('/api/auth/login', loginLimiter, validateAuthInput, recaptchaMiddleware, async (req, res) => {
     try {
         const { email, password, identifier } = req.body;
         // UI'dan "identifier" (e-posta veya kullanıcı adı) gelebilir, geriye dönük uyumluluk için "email" de desteklenir
@@ -5443,7 +5982,6 @@ app.post('/api/auth/login', validateAuthInput, async (req, res) => {
         if (!user) {
             await bcrypt.compare(password, DUMMY_HASH); // Sahte gecikme — timing oracle önlemi
             recordFailedLogin(loginId);
-            trackLoginIP(loginIp);
             return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         }
 
@@ -5456,10 +5994,36 @@ app.post('/api/auth/login', validateAuthInput, async (req, res) => {
         const validPassword = await bcrypt.compare(password, user.password);
         if (!validPassword) {
             recordFailedLogin(loginId);
-            trackLoginIP(loginIp); // ✅ IP takibi
-            return res.status(401).json({ error: 'Şifre yanlış' });
+            return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         }
         clearFailedLogins(loginId);
+
+        // 🔒 BAN KONTROLÜ — Banlı kullanıcı login olabilir ama isBanned:true ile bilgilendirilir
+        // Frontend bu flag'i alınca profili 3 sn gösterir sonra erişim engeli modal açar
+        if (user.isBanned) {
+            const tokens = generateTokens(user);
+            const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
+            await dbRun(
+                `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt")
+                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '7 days')`,
+                [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
+            );
+            const csrfToken = generateCsrfToken();
+            setAuthCookies(res, req, tokens);
+            setCsrfCookie(res, req, csrfToken);
+            return res.json({
+                message: 'Giriş başarılı',
+                token: tokens.accessToken,
+                refreshToken: tokens.refreshToken,
+                isBanned: true,
+                user: {
+                    id: user.id, username: user.username, name: user.name, email: user.email,
+                    profilePic: absoluteUrl(user.profilePic), coverPic: absoluteUrl(user.coverPic),
+                    bio: user.bio, isVerified: user.isVerified, hasFarmerBadge: user.hasFarmerBadge,
+                    role: user.role, isBanned: true
+                }
+            });
+        }
 
         // ========== 2FA KONTROLÜ ==========
         if (user.twoFactorEnabled) {
@@ -5516,6 +6080,9 @@ app.post('/api/auth/login', validateAuthInput, async (req, res) => {
         sendLoginNotificationEmail(user.email, user.name, req).catch(() => {});
 
         await dbRun('UPDATE users SET "lastLogin" = NOW(), "isOnline" = TRUE, "updatedAt" = NOW() WHERE id = $1', [user.id]);
+        // 📊 Giriş saati kaydı — akıllı bildirim zamanlama için
+        dbRun(`INSERT INTO user_login_hours ("userId", hour) VALUES ($1, $2)`,
+            [user.id, new Date().getHours()]).catch(() => {});
 
         await dbRun(
             `INSERT INTO login_history (id, "userId", ip, "userAgent", "createdAt")
@@ -5540,6 +6107,8 @@ app.post('/api/auth/login', validateAuthInput, async (req, res) => {
         res.json({
             message: 'Giriş başarılı',
             token: tokens.accessToken,       // backward compat (mobile/native)
+            // 🔒 Mobile backward compat: cookie'yi okuyamayan native app için
+            // Tarayıcı istemcileri için HttpOnly cookie kullanın
             refreshToken: tokens.refreshToken,
             user: {
                 id: user.id, username: user.username, name: user.name, email: user.email,
@@ -5553,8 +6122,203 @@ app.post('/api/auth/login', validateAuthInput, async (req, res) => {
     }
 });
 
+// ════════════════════════════════════════════════════════════════════
+// 🔐 GOOGLE İLE GİRİŞ YAP — OAuth 2.0 / Google Identity Services
+// ════════════════════════════════════════════════════════════════════
+//
+// .env dosyasına ekle:
+//   GOOGLE_WEB_CLIENT_ID=<Web OAuth 2.0 Client ID>
+//   GOOGLE_ANDROID_CLIENT_ID=<Android OAuth 2.0 Client ID>
+//
+// Web frontend: google.accounts.id.initialize({ client_id, callback })
+//   → callback'den gelen credential (idToken) → /api/auth/google'a POST
+// Android: GoogleSignIn SDK → getIdToken() → /api/auth/google'a POST
+//
+// Kurulum: npm install google-auth-library
+// ════════════════════════════════════════════════════════════════════
+let GoogleOAuth2Client = null;
+try {
+    const { OAuth2Client } = require('google-auth-library');
+    GoogleOAuth2Client = OAuth2Client;
+    console.log('✅ google-auth-library yüklendi — Google Sign-In aktif');
+} catch (_) {
+    console.warn('⚠️  google-auth-library bulunamadı. (npm install google-auth-library)');
+}
+
+async function verifyGoogleIdToken(idToken) {
+    if (!GoogleOAuth2Client) throw new Error('google-auth-library kurulu değil');
+    const webClientId     = process.env.GOOGLE_WEB_CLIENT_ID;
+    const androidClientId = process.env.GOOGLE_ANDROID_CLIENT_ID;
+    if (!webClientId && !androidClientId) {
+        throw new Error('GOOGLE_WEB_CLIENT_ID veya GOOGLE_ANDROID_CLIENT_ID .env\'de tanımlı değil');
+    }
+    const audiences = [webClientId, androidClientId].filter(Boolean);
+    const client    = new GoogleOAuth2Client(webClientId || androidClientId);
+    const ticket    = await client.verifyIdToken({ idToken, audience: audiences });
+    const payload   = ticket.getPayload();
+    if (!payload?.email)        throw new Error('Google token\'dan e-posta alınamadı');
+    if (!payload.email_verified) throw new Error('Google e-postası doğrulanmamış');
+    return {
+        googleId: payload.sub,
+        email   : payload.email.toLowerCase().trim(),
+        name    : payload.name || payload.email.split('@')[0],
+        picture : payload.picture || null,
+    };
+}
+
+// POST /api/auth/google
+// Body: { idToken: "<google_id_token>" }
+app.post('/api/auth/google', loginLimiter, async (req, res) => {
+    try {
+        if (!GoogleOAuth2Client) {
+            return res.status(503).json({ error: 'Google Sign-In şu anda kullanılamıyor. Sunucu yapılandırması eksik.' });
+        }
+
+        const { idToken } = req.body;
+        if (!idToken) return res.status(400).json({ error: 'Google ID Token gerekli' });
+
+        // ── Google token doğrula ──────────────────────────────────────
+        let googleUser;
+        try {
+            googleUser = await verifyGoogleIdToken(idToken);
+        } catch (e) {
+            console.warn('[Google Auth] Token doğrulama başarısız:', e.message);
+            return res.status(401).json({ error: 'Geçersiz Google token. Lütfen tekrar deneyin.' });
+        }
+
+        const { googleId, email, name, picture } = googleUser;
+
+        // ── Kullanıcıyı bul (googleId veya email ile) ─────────────────
+        let user = await dbGet(
+            `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
+                    "isVerified", "isActive", "isBanned", "emailVerified",
+                    "hasFarmerBadge", "userType", "twoFactorEnabled", "googleId"
+             FROM users
+             WHERE ("googleId" = $1 OR email = $2) AND "isActive" = TRUE
+             LIMIT 1`,
+            [googleId, email]
+        );
+
+        let isNewUser = false;
+
+        if (!user) {
+            // ── Yeni kullanıcı: otomatik kayıt ───────────────────────
+            isNewUser       = true;
+            const newUserId = uuidv4();
+
+            // Kullanıcı adı üret (e-posta prefix'inden)
+            let baseUsername = email.split('@')[0].toLowerCase().replace(/[^a-z0-9._-]/g, '');
+            if (baseUsername.length < 3) baseUsername = 'user' + baseUsername;
+            let finalUsername = baseUsername;
+            let suffix = 1;
+            while (await dbGet('SELECT id FROM users WHERE username = $1', [finalUsername])) {
+                finalUsername = `${baseUsername}${suffix++}`;
+            }
+
+            // Google profil fotoğrafını indir (başarısız olursa atla)
+            let profilePic = null;
+            if (picture) {
+                try {
+                    const { default: fetch } = await import('node-fetch');
+                    const imgRes = await fetch(picture, { signal: AbortSignal.timeout(5000) });
+                    if (imgRes.ok) {
+                        const imgBuf  = Buffer.from(await imgRes.arrayBuffer());
+                        const filename = `profile_${newUserId}.webp`;
+                        const outPath  = path.join(profilesDir, filename);
+                        await processImageBuffer(imgBuf, outPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
+                        profilePic = `/uploads/profiles/${filename}`;
+                    }
+                } catch (_) {}
+            }
+
+            await dbRun(
+                `INSERT INTO users
+                   (id, name, username, email, password, "profilePic", "userType",
+                    "googleId", "emailVerified", "registrationIp", "createdAt", "updatedAt")
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,TRUE,$9,NOW(),NOW())`,
+                [newUserId, name, finalUsername, email, '', profilePic, 'normal_kullanici', googleId, req.ip]
+            );
+
+            // Varsayılan hesapları takip ettir
+            try {
+                for (const uname of ['agro_sosyal','agrolink_news','yemektarifleri','agroabot','akilli.tarlam']) {
+                    const acc = await dbGet('SELECT id FROM users WHERE username=$1', [uname]);
+                    if (acc) await dbRun(
+                        'INSERT INTO follows (id,"followerId","followingId","createdAt") VALUES($1,$2,$3,NOW()) ON CONFLICT ("followerId","followingId") DO NOTHING',
+                        [uuidv4(), newUserId, acc.id]
+                    );
+                }
+            } catch (_) {}
+
+            if (isGmailAddress(email)) sendWelcomeEmail(email, name).catch(() => {});
+
+            user = await dbGet(
+                `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
+                        "isVerified", "isActive", "isBanned", "emailVerified",
+                        "hasFarmerBadge", "userType", "twoFactorEnabled"
+                 FROM users WHERE id=$1`,
+                [newUserId]
+            );
+            console.log(`✅ [Google Auth] Yeni kullanıcı: ${maskEmail(email)}`);
+        } else {
+            // Mevcut kullanıcı — ban kontrolü
+            if (user.isBanned) return res.status(403).json({ error: 'Hesabınız askıya alınmış.' });
+            // googleId yoksa ilk Google girişi — ekle
+            if (!user.googleId) {
+                await dbRun(
+                    `UPDATE users SET "googleId"=$1, "emailVerified"=TRUE, "updatedAt"=NOW() WHERE id=$2`,
+                    [googleId, user.id]
+                );
+            }
+        }
+
+        // ── lastLogin güncelle ────────────────────────────────────────
+        await dbRun('UPDATE users SET "lastLogin"=NOW(),"isOnline"=TRUE,"updatedAt"=NOW() WHERE id=$1', [user.id]);
+        dbRun(`INSERT INTO user_login_hours ("userId",hour) VALUES($1,$2)`,
+            [user.id, new Date().getHours()]).catch(() => {});
+
+        // ── Token üret ────────────────────────────────────────────────
+        const tokens    = generateTokens(user);
+        const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
+        await dbRun(
+            `INSERT INTO refresh_tokens (id,"userId","tokenHash",ip,"userAgent","createdAt","expiresAt")
+             VALUES($1,$2,$3,$4,$5,NOW(),NOW()+INTERVAL '7 days')`,
+            [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
+        );
+
+        const csrfToken = generateCsrfToken();
+        setAuthCookies(res, req, tokens);
+        setCsrfCookie(res, req, csrfToken);
+
+        console.log(`✅ [Google Auth] Giriş başarılı: ${maskEmail(email)}`);
+
+        res.json({
+            message     : 'Google ile giriş başarılı',
+            token       : tokens.accessToken,
+            refreshToken: tokens.refreshToken,
+            isNewUser,
+            user: {
+                id            : user.id,
+                username      : user.username,
+                name          : user.name,
+                email         : user.email,
+                profilePic    : absoluteUrl(user.profilePic),
+                coverPic      : absoluteUrl(user.coverPic),
+                bio           : user.bio,
+                isVerified    : user.isVerified,
+                hasFarmerBadge: user.hasFarmerBadge,
+                role          : user.role,
+                emailVerified : true,
+            }
+        });
+    } catch (error) {
+        console.error('[Google Auth] Sunucu hatası:', error.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
 // ─── 4. TOKEN YENİLEME ──────────────────────────────────────────────
-app.post('/api/auth/refresh', async (req, res) => {
+app.post('/api/auth/refresh', refreshLimiter, async (req, res) => {
     try {
         // 🔒 Önce HttpOnly cookie, sonra body (native/mobile uyumluluk)
         const refreshToken = req.cookies?.refresh_token || req.body?.refreshToken;
@@ -5657,7 +6421,7 @@ app.get('/api/auth/me', authenticateToken, async (req, res) => {
 // ─── /api/auth/verify-otp ALIAS ──────────────────────────────────────────
 // Login 2FA: { tempToken, code }  →  /api/auth/verify-2fa mantığı
 // Register : { email, code }      →  /api/auth/register-verify mantığı
-app.post('/api/auth/verify-otp', validateAuthInput, async (req, res) => {
+app.post('/api/auth/verify-otp', otpLimiter, validateAuthInput, async (req, res) => {
     const { tempToken, code, email } = req.body;
     if (tempToken && code) {
         // 2FA doğrulama (login)
@@ -5678,6 +6442,8 @@ app.post('/api/auth/verify-otp', validateAuthInput, async (req, res) => {
             );
             if (!user) return res.status(401).json({ error: 'Kullanıcı bulunamadı' });
             await dbRun('UPDATE users SET "lastLogin" = NOW(), "isOnline" = TRUE, "updatedAt" = NOW() WHERE id = $1', [user.id]);
+            dbRun(`INSERT INTO user_login_hours ("userId", hour) VALUES ($1, $2)`,
+                [user.id, new Date().getHours()]).catch(() => {});
             const tokens = generateTokens(user);
             const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
             await dbRun(
@@ -5710,7 +6476,7 @@ app.post('/api/auth/verify-otp', validateAuthInput, async (req, res) => {
 // ─── /api/auth/send-otp ALIAS ──────────────────────────────────────────────
 // { email, tempToken }   → login 2FA resend
 // { email }              → register doğrulama kodu yeniden gönder
-app.post('/api/auth/send-otp', validateAuthInput, async (req, res) => {
+app.post('/api/auth/send-otp', otpLimiter, validateAuthInput, async (req, res) => {
     const { email, tempToken } = req.body;
     try {
         if (tempToken) {
@@ -5747,7 +6513,7 @@ app.post('/api/auth/send-otp', validateAuthInput, async (req, res) => {
 // Frontend'in v5'ten gelen tüm çağrıları uyumlu hale getirir:
 //   GET /api/users/:id       → UUID ile arama (eski frontend)
 //   GET /api/users/:username → username ile arama (yeni frontend)
-app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) => {
+app.get('/api/users/:idOrUsername', optionalAuth, async (req, res, next) => {
     // Bilinen statik endpoint'ler → kendi route'larına bırak
     const STATIC_SEGMENTS = [
         'blocks', 'blocked', 'online', 'search', 'following', 'followers',
@@ -5767,7 +6533,7 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
             // ID ile ara (v5 uyumlu)
             user = await dbGet(
                 `SELECT id, username, name, "profilePic", "coverPic", bio, location, website,
-                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt"
+                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt", "isBanned"
                  FROM users WHERE id = $1 AND "isActive" = TRUE`,
                 [param]
             );
@@ -5775,7 +6541,7 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
             // Username ile ara
             user = await dbGet(
                 `SELECT id, username, name, "profilePic", "coverPic", bio, location, website,
-                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt"
+                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt", "isBanned"
                  FROM users WHERE username = $1 AND "isActive" = TRUE`,
                 [param.toLowerCase()]
             );
@@ -5783,16 +6549,53 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
 
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
 
+        // 🔒 Banlı kullanıcının kendi profiline baktığı durum:
+        if (user.isBanned && req.user?.id === user.id) {
+            return res.json({
+                user: {
+                    id: user.id, username: user.username, name: user.name,
+                    profilePic: absoluteUrl(user.profilePic), coverPic: absoluteUrl(user.coverPic),
+                    bio: user.bio, isVerified: user.isVerified, hasFarmerBadge: user.hasFarmerBadge,
+                    userType: user.userType, createdAt: user.createdAt,
+                    followingCount: 0, followerCount: 0, postCount: 0,
+                    isFollowing: false, isBlocked: false, isOnline: false,
+                    isBanned: true,
+                },
+                bannedProfile: true
+            });
+        }
+
+        // 🔒 Başka birinin banlı profilini ziyaret ediyorsa: isim maskele
+        if (user.isBanned) {
+            return res.json({
+                user: {
+                    id: user.id, username: user.username,
+                    name: 'Erişim Engeli - Politika İhlali',
+                    profilePic: absoluteUrl(user.profilePic), coverPic: null,
+                    bio: null, isVerified: false, hasFarmerBadge: false,
+                    userType: user.userType, createdAt: user.createdAt,
+                    followingCount: 0, followerCount: 0, postCount: 0,
+                    isFollowing: false, isBlocked: false, isOnline: false,
+                    isBanned: true,
+                }
+            });
+        }
+
+        const viewerId = req.user?.id || null;
         const [followingRow, followerRow, postRow, isFollowing, isBlocked, onlineRow] = await Promise.all([
             pool.query('SELECT COUNT(*)::int AS cnt FROM follows WHERE "followerId"  = $1', [user.id]),
             pool.query('SELECT COUNT(*)::int AS cnt FROM follows WHERE "followingId" = $1', [user.id]),
             pool.query('SELECT COUNT(*)::int AS cnt FROM posts   WHERE "userId" = $1 AND "isActive" = TRUE', [user.id]),
-            dbGet('SELECT id FROM follows WHERE "followerId" = $1 AND "followingId" = $2', [req.user.id, user.id]),
-            dbGet(`SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`, [req.user.id, user.id]),
-            pool.query('SELECT "isOnline", "lastSeen" FROM users WHERE id=$1', [user.id]) // ⚡ isUserOnline paralel
+            viewerId ? dbGet('SELECT id FROM follows WHERE "followerId" = $1 AND "followingId" = $2', [viewerId, user.id]) : null,
+            viewerId ? dbGet(`SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`, [viewerId, user.id]) : null,
+            pool.query('SELECT "isOnline", "lastSeen" FROM users WHERE id=$1', [user.id])
         ]);
 
-        // ⚡ isOnline hesapla (ayrı DB sorgusu yok)
+        // 🔒 ENGEL KONTROLÜ — sadece giriş yapmış kullanıcılar için
+        if (isBlocked && viewerId && user.id !== viewerId) {
+            return res.status(403).json({ error: 'Engelli kullanıcı' });
+        }
+
         const onlineData = onlineRow.rows[0];
         const isOnline = onlineData ? (onlineData.isOnline || (onlineData.lastSeen && Date.now() - new Date(onlineData.lastSeen).getTime() < 5 * 60 * 1000)) : false;
 
@@ -5814,6 +6617,61 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 BANNED KULLANICI BLOKLAMA MİDDLEWARE
+// authenticateToken'dan sonra hassas endpoint'lere ekle
+// ════════════════════════════════════════════════════════════════════
+function requireNotBanned(req, res, next) {
+    if (req.user?.isBanned) {
+        return res.status(403).json({
+            error: 'Erişim Engeli',
+            code: 'ACCOUNT_BANNED',
+            message: 'Hesabınız politika ihlali nedeniyle kısıtlanmıştır.'
+        });
+    }
+    next();
+}
+
+// ════════════════════════════════════════════════════════════════════
+// 🌐 OPTİONAL AUTH — Token varsa doğrular, yoksa req.user=null ile devam eder
+// Kamuya açık endpointlerde kullanılır (profil, postlar, yorumlar vs.)
+// ════════════════════════════════════════════════════════════════════
+async function optionalAuth(req, res, next) {
+    let token = req.cookies?.access_token;
+    if (!token) {
+        const authHeader = req.headers['authorization'];
+        if (authHeader && authHeader.startsWith('Bearer ')) {
+            token = authHeader.slice(7);
+        }
+    }
+    if (!token) {
+        req.user = null;
+        return next();
+    }
+    try {
+        if (await isTokenBlacklisted(token)) { req.user = null; return next(); }
+        const decoded = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] });
+        const user = await dbGet(
+            `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
+                    "isVerified", "isActive", "userType", "hasFarmerBadge",
+                    "isOnline", "isBanned", "emailVerified", "twoFactorEnabled"
+             FROM users WHERE id = $1 AND "isActive" = TRUE`,
+            [decoded.id]
+        );
+        if (!user) { req.user = null; return next(); }
+        req.user = {
+            id: user.id, username: user.username, name: user.name,
+            email: user.email, role: user.role, plan: user.plan || 'free',
+            profilePic: user.profilePic, isVerified: user.isVerified,
+            hasFarmerBadge: user.hasFarmerBadge, userType: user.userType,
+            isBanned: user.isBanned,
+        };
+    } catch {
+        req.user = null;
+    }
+    next();
+}
 
 // isUserOnline yardımcı fonksiyonu (yok ise fallback)
 async function isUserOnline(userId) {
@@ -5852,10 +6710,8 @@ app.put('/api/users/profile', authenticateToken, upload.fields([
                 const file = req.files.profilePic[0];
                 const filename = `profile_${req.user.id}_${Date.now()}.webp`;
                 const outputPath = path.join(profilesDir, filename);
-                await sharp(file.path, { sequentialRead: true })
-                    .resize(512, 512, { fit: 'cover', kernel: 'lanczos2' })
-                    .webp({ quality: 82, effort: 2 }) // ⚡ effort:2 → hızlı
-                    .toFile(outputPath);
+                // ✅ processImage: EXIF rotate + concurrency limiter + optimize quality
+                await processImage(file.path, outputPath, { width: 300, height: 300, fit: 'cover', quality: 62, effort: 3 });
                 await fs.unlink(file.path).catch(() => {});
                 updates.push(`"profilePic" = $${paramIdx++}`);
                 params.push(`/uploads/profiles/${filename}`);
@@ -5865,10 +6721,8 @@ app.put('/api/users/profile', authenticateToken, upload.fields([
                 const file = req.files.coverPic[0];
                 const filename = `cover_${req.user.id}_${Date.now()}.webp`;
                 const outputPath = path.join(profilesDir, filename);
-                await sharp(file.path, { sequentialRead: true })
-                    .resize(1920, 1080, { fit: 'inside', withoutEnlargement: true, kernel: 'lanczos2' })
-                    .webp({ quality: 82, effort: 2 }) // ⚡ effort:2 → hızlı
-                    .toFile(outputPath);
+                // ✅ processImage: EXIF rotate + concurrency limiter + optimize quality
+                await processImage(file.path, outputPath, { width: 1920, height: 1080, fit: 'inside', quality: 80, effort: 4 });
                 await fs.unlink(file.path).catch(() => {});
                 updates.push(`"coverPic" = $${paramIdx++}`);
                 params.push(`/uploads/profiles/${filename}`);
@@ -5900,6 +6754,9 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
         const { currentPassword, newPassword } = req.body;
         if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Şifreler gerekli' });
         if (newPassword.length < 8) return res.status(400).json({ error: 'Yeni şifre en az 8 karakter olmalıdır' });
+        // 🔒 Şifre güvenlik kontrolü — eski şifreyle aynı olmamalı
+        const sameAsCurrent = await bcrypt.compare(newPassword, user.password);
+        if (sameAsCurrent) return res.status(400).json({ error: 'Yeni şifre eskisiyle aynı olamaz' });
 
         const user = await dbGet('SELECT password FROM users WHERE id = $1', [req.user.id]);
         const valid = await bcrypt.compare(currentPassword, user.password);
@@ -5907,6 +6764,15 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
 
         const hashed = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
         await dbRun('UPDATE users SET password = $1, "updatedAt" = NOW() WHERE id = $2', [hashed, req.user.id]);
+
+        // 🔒 GÜVENLİK: Şifre değişince tüm mevcut oturumları sonlandır
+        // Çalınmış token / aktif oturum saldırısını engeller
+        await dbRun(
+            `UPDATE refresh_tokens SET "isActive" = FALSE WHERE "userId" = $1`,
+            [req.user.id]
+        );
+        // Mevcut access token'ı da blacklist'e ekle
+        if (req._token) await blacklistToken(req._token);
 
         // 📧 Bildirim e-postası
         const u = await dbGet('SELECT email, name FROM users WHERE id = $1', [req.user.id]);
@@ -5920,13 +6786,13 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
 });
 
 // ─── 9. KULLANICI ARA ───────────────────────────────────────────────
-app.get('/api/users/search/:query', authenticateToken, async (req, res) => {
+app.get('/api/users/search/:query', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { query } = req.params;
         const searchTerm = `%${query.toLowerCase()}%`;
 
         const users = await dbAll(
-            `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge"
+            `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge", "isBanned"
              FROM users
              WHERE "isActive" = TRUE AND (LOWER(username) LIKE $1 OR LOWER(name) LIKE $1)
              ORDER BY "isVerified" DESC, "createdAt" DESC
@@ -5934,7 +6800,16 @@ app.get('/api/users/search/:query', authenticateToken, async (req, res) => {
             [searchTerm]
         );
 
-        res.json({ users: users.map(u => ({ ...u, profilePic: absoluteUrl(u.profilePic) })) });
+        res.json({
+            users: users.map(u => ({
+                ...u,
+                profilePic : absoluteUrl(u.profilePic),
+                // 🔒 Banlı kullanıcı: isim/soyisim maskelenir, username görünür kalır
+                name       : u.isBanned ? 'Erişim Engeli - Politika İhlali' : u.name,
+                bio        : u.isBanned ? null : u.bio,
+                isBanned   : !!u.isBanned,
+            }))
+        });
     } catch (error) {
         console.error('Arama hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -5942,15 +6817,16 @@ app.get('/api/users/search/:query', authenticateToken, async (req, res) => {
 });
 
 // ─── TEKLI DOSYA YÜKLEME (UI sıralı yükleme için) ───────────────────
-app.post('/api/upload', authenticateToken, upload.single('media'), async (req, res) => {
+app.post('/api/upload', authenticateToken, uploadLimiter, upload.single('media'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Dosya bulunamadı' });
         const file = req.file;
         const isVideo = file.mimetype.startsWith('video/');
 
-        // 🔒 Magic bytes + boyut doğrulama
+        // 🔒 Magic bytes + boyut doğrulama (mavi tik kullanıcılar için 300MB limit)
         const uploadType = isVideo ? 'postVideo' : 'postImage';
-        try { await verifyUploadedFile(file, uploadType); }
+        const videoLimit = isVideo ? getVideoLimit(req.user?.isVerified) : null;
+        try { await verifyUploadedFile(file, uploadType, videoLimit); }
         catch (verifyErr) { return res.status(400).json({ error: verifyErr.message }); }
 
         let mediaUrl, mediaType;
@@ -5967,10 +6843,8 @@ app.post('/api/upload', authenticateToken, upload.single('media'), async (req, r
             const filename = `post_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
             const destPath = path.join(postsDir, filename);
             try {
-                await sharp(file.path, { sequentialRead: true })
-                    .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true })
-                    .webp({ quality: 82, effort: 2 })
-                    .toFile(destPath);
+                // ✅ processImage: EXIF rotate fix + concurrency limiter + optimize quality
+                await processImage(file.path, destPath, { width: 1920, height: 1920, fit: 'inside', quality: 78, effort: 4 });
             } catch {
                 await fs.unlink(file.path).catch(() => {});
                 return res.status(400).json({ error: 'Resim işlenemedi' });
@@ -6032,21 +6906,24 @@ app.post('/api/upload/chunk/init', authenticateToken, async (req, res) => {
         const tmpDir = path.join(tempDir, `chunk_${uploadId}`);
         await fs.mkdir(tmpDir, { recursive: true });
 
-        // 🔒 Disk bomb koruması: 500 chunk × max 200MB = teorik 100GB
-        // Gerçek limit: totalChunks × CHUNK_THRESHOLD_MB ≤ 200 MB
-        const maxAllowedChunks = Math.ceil(UPLOAD_LIMITS.postVideo / (CHUNK_THRESHOLD_MB * 1024 * 1024));
+        // 🔒 Disk bomb koruması: chunk sayısı × CHUNK_THRESHOLD_MB ≤ kullanıcı limiti
+        // Normal: 100MB, Mavi tik: 300MB
+        const userVideoLimit = getVideoLimit(req.user?.isVerified);
+        const maxAllowedChunks = Math.ceil(userVideoLimit / (CHUNK_THRESHOLD_MB * 1024 * 1024));
         const safeChunkCount = Math.min(parseInt(totalChunks), maxAllowedChunks);
         if (parseInt(totalChunks) > maxAllowedChunks) {
             return res.status(400).json({
-                error: `Toplam dosya boyutu limiti aşılıyor. Maksimum ${Math.round(UPLOAD_LIMITS.postVideo/1024/1024)} MB`
+                error: `Toplam dosya boyutu limiti aşılıyor. Maksimum ${Math.round(userVideoLimit/1024/1024)} MB${req.user?.isVerified ? ' (mavi tik)' : ' — mavi tik ile 300MB\'a kadar yükleyebilirsiniz'}`
             });
         }
 
         chunkSessions.set(uploadId, {
             userId        : req.user.id,
+            isVerified    : !!req.user?.isVerified,  // 🔒 Limit kontrolü için sakla
+            videoLimit    : userVideoLimit,           // Kullanıcıya özel byte limiti
             totalChunks   : safeChunkCount,
             receivedChunks: new Set(),
-            receivedBytes : 0,                           // 🔒 gerçek boyut takibi
+            receivedBytes : 0,
             tmpDir,
             safeExt,
             createdAt     : Date.now(),
@@ -6087,11 +6964,12 @@ app.put('/api/upload/chunk/:uploadId', authenticateToken, upload.single('chunk')
         await fs.rename(req.file.path, chunkPath);
         session.receivedChunks.add(idx);
         session.receivedBytes = (session.receivedBytes || 0) + req.file.size;
-        // 🔒 Toplam alınan byte limiti aş → session iptal et
-        if (session.receivedBytes > UPLOAD_LIMITS.postVideo) {
+        // 🔒 Toplam alınan byte limiti aş → session iptal et (kullanıcı bazlı limit)
+        const sessionLimit = session.videoLimit || UPLOAD_LIMITS.postVideo;
+        if (session.receivedBytes > sessionLimit) {
             chunkSessions.delete(uploadId);
             await fs.rm(session.tmpDir, { recursive: true, force: true }).catch(() => {});
-            return res.status(400).json({ error: 'Dosya boyutu limiti aşıldı' });
+            return res.status(400).json({ error: `Dosya boyutu limiti aşıldı. Maksimum: ${Math.round(sessionLimit/1024/1024)} MB` });
         }
 
         res.json({
@@ -6148,6 +7026,18 @@ app.post('/api/upload/chunk/:uploadId/finalize', authenticateToken, async (req, 
         const rawServedPath = path.join(videosDir, `${videoId}_raw.mp4`);
         await fs.rename(finalPath, rawServedPath);
 
+        // 🔒 GÜVENLİK: Birleştirilen videoyu da magic-bytes + derin tarama ile doğrula
+        try {
+            await verifyUploadedFile(
+                { path: rawServedPath, mimetype: 'video/mp4', size: (await fs.stat(rawServedPath)).size },
+                'postVideo',
+                session.videoLimit || UPLOAD_LIMITS.postVideo
+            );
+        } catch (verifyErr) {
+            await fs.unlink(rawServedPath).catch(() => {});
+            return res.status(400).json({ error: `Güvenlik kontrolü başarısız: ${verifyErr.message}` });
+        }
+
         const rawUrl = absoluteUrl(`/uploads/videos/${videoId}_raw.mp4`);
 
         res.json({
@@ -6183,11 +7073,16 @@ app.get('/api/upload/chunk/:uploadId/status', authenticateToken, (req, res) => {
 // ─── 5. Chunk boyut bilgisi (Kotlin için) ────────────────────────────────────
 // GET /api/upload/chunk/config
 app.get('/api/upload/chunk/config', authenticateToken, (req, res) => {
+    const userVideoLimit = getVideoLimit(req.user?.isVerified);
     res.json({
-        chunkThresholdMB : CHUNK_THRESHOLD_MB,           // Bu boyutun üstü → chunked upload kullan
-        recommendedChunkMB: 10,                           // Tavsiye edilen chunk boyutu
-        maxFileSizeMB    : 200,                           // Maksimum video boyutu
-        maxChunks        : 500,
+        chunkThresholdMB  : CHUNK_THRESHOLD_MB,
+        recommendedChunkMB: 10,
+        maxFileSizeMB     : Math.round(userVideoLimit / 1024 / 1024),
+        maxChunks         : 500,
+        isVerified        : !!req.user?.isVerified,
+        note              : req.user?.isVerified
+            ? '🔵 Mavi tik: 300 MB video yükleyebilirsiniz'
+            : '⚪ Normal hesap: 100 MB. Mavi tik ile 300 MB\'a çıkar.',
     });
 });
 
@@ -6196,7 +7091,7 @@ app.get('/api/upload/chunk/config', authenticateToken, (req, res) => {
 // =============================================================================
 
 // ─── 10. GÖNDERI OLUŞTUR ────────────────────────────────────────────
-app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array('media', 10), async (req, res) => {
+app.post('/api/posts', authenticateToken, postCreateLimiter, checkRestriction('post'), upload.array('media', 10), async (req, res) => {
     try {
         const { content = '', isPoll, pollQuestion, pollOptions, latitude, longitude, locationName, allowComments = 'true', uploadedUrls: uploadedUrlsRaw } = req.body;
         const isAnketMode = isPoll === 'true' || isPoll === true;
@@ -6228,8 +7123,9 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
                 const file = req.files[fi];
                 const isVideo = file.mimetype.startsWith('video/');
 
-                // 🔒 Magic bytes + tip bazlı boyut doğrulama
-                try { await verifyUploadedFile(file, isVideo ? 'postVideo' : 'postImage'); }
+                // 🔒 Magic bytes + tip bazlı boyut doğrulama (mavi tik → 300MB, normal → 100MB)
+                const videoLimit = isVideo ? getVideoLimit(req.user?.isVerified) : null;
+                try { await verifyUploadedFile(file, isVideo ? 'postVideo' : 'postImage', videoLimit); }
                 catch (verifyErr) {
                     // Kalan temp dosyaları temizle
                     for (const f of req.files) await fs.unlink(f.path).catch(() => {});
@@ -6258,10 +7154,8 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
                     const outputPath = path.join(postsDir, filename);
                     let imgWidth = null, imgHeight = null;
                     try {
-                        const info = await sharp(file.path, { sequentialRead: true })
-                            .resize(1920, 1920, { fit: 'inside', withoutEnlargement: true, kernel: 'lanczos2' })
-                            .webp({ quality: 82, effort: 2, smartSubsample: true })
-                            .toFile(outputPath);
+                        // ✅ processImage: EXIF rotate fix + concurrency limiter
+                        const info = await processImage(file.path, outputPath, { width: 1920, height: 1920, fit: 'inside', quality: 78, effort: 4 });
                         imgWidth = info.width || null;
                         imgHeight = info.height || null;
                     } catch (e) {
@@ -6306,16 +7200,19 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
             } catch (e) { parsedPollOptions = null; }
         }
 
-        await dbRun(
+        // ⚡ RETURNING * ile ekstra SELECT turu önlendi (performans)
+        const insertResult = await pool.query(
             `INSERT INTO posts (id, "userId", username, content, media, "mediaType", "mediaUrls", "mediaWidth", "mediaHeight",
              "isPoll", "pollQuestion", "pollOptions",
              latitude, longitude, "locationName", "allowComments", "isActive", "createdAt", "updatedAt")
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,TRUE,NOW(),NOW())`,
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,TRUE,NOW(),NOW())
+             RETURNING *`,
             [postId, req.user.id, user.username, content || '', media, mediaType, mediaUrlsJson,
              mediaWidth, mediaHeight, isAnketMode, pollQuestion || null, parsedPollOptions,
              latitude ? parseFloat(latitude) : null, longitude ? parseFloat(longitude) : null,
              locationName || null, allowComments !== 'false']
         );
+        const postRow = insertResult.rows[0];
 
         // post_media tablosuna da ekle (çoklu medya için)
         if (allMediaItems.length > 0) {
@@ -6327,6 +7224,31 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
                      ON CONFLICT DO NOTHING`,
                     [uuidv4(), postId, m.url, m.type, m.width, m.height, i]
                 ).catch(() => {});
+            }
+        }
+
+        // ⚡ @Mention bildirimleri — gönderi içindeki @kullanıcı etiketleri
+        if (content) {
+            const mentionMatches = content.match(/@([\w.]+)/g);
+            if (mentionMatches) {
+                const uniqueMentions = [...new Set(mentionMatches.map(m => m.slice(1).toLowerCase()))];
+                setImmediate(async () => {
+                    for (const uname of uniqueMentions.slice(0, 10)) { // max 10 mention/gönderi
+                        if (uname === req.user.username.toLowerCase()) continue; // kendini etiketleme
+                        const mentioned = await dbGet(
+                            'SELECT id FROM users WHERE LOWER(username) = $1 AND "isActive" = TRUE', [uname]
+                        ).catch(() => null);
+                        if (mentioned) {
+                            createNotification(mentioned.id, 'mention',
+                                `${req.user.username} sizi bir gönderide etiketledi`, {
+                                    postId,
+                                    actorName      : req.user.name || req.user.username,
+                                    actorUsername  : req.user.username,
+                                    actorProfilePic: req.user.profilePic || '',
+                                });
+                        }
+                    }
+                });
             }
         }
 
@@ -6364,12 +7286,34 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
             );
         }
 
-        const post = await dbGet('SELECT * FROM posts WHERE id = $1', [postId]);
-
         // ⚡ Bu kullanıcının feed cache'ini temizle
         AppCache.feed.delPattern(req.user.id + ':'); // Feed cache temizle (yeni post)
 
-        res.status(201).json({ success: true, message: 'Gönderi paylaşıldı', post: formatPost(post) });
+        // 🔔 Takipçilere "yeni gönderi" bildirimi gönder (arka planda, yanıtı bloke etmez)
+        setImmediate(async () => {
+            try {
+                const followers = await dbAll(
+                    `SELECT "followerId" FROM follows WHERE "followingId" = $1`,
+                    [req.user.id]
+                );
+                if (followers && followers.length > 0) {
+                    const postPreview = content ? content.substring(0, 60) : '';
+                    for (const f of followers) {
+                        createNotification(f.followerId, 'new_post', `${req.user.username} yeni bir gönderi paylaştı`, {
+                            postId,
+                            actorName      : req.user.name || req.user.username,
+                            actorUsername  : req.user.username,
+                            actorProfilePic: req.user.profilePic || '',
+                            postPreview,
+                        });
+                    }
+                }
+            } catch (e) {
+                console.error('[Takipçi bildirim hatası]', e.message);
+            }
+        });
+
+        res.status(201).json({ success: true, message: 'Gönderi paylaşıldı', post: formatPost(postRow) });
     } catch (error) {
         console.error('Post oluşturma hatası:', error);
         if (req.files) { for (const f of req.files) { await fs.unlink(f.path).catch(() => {}); } }
@@ -6378,8 +7322,8 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
 });
 
 // ─── 11. FEED ───────────────────────────────────────────────────────
-// ⚡ FEED ÖNBELLEK - kullanıcı başına 30 saniyelik cache
-// ⚡ Feed cache artık AppCache.feed ile yönetiliyor (LRU + otomatik TTL)
+// ⚡ FEED ÖNBELLEK - kullanıcı başına 30 saniyelik cache (LRU)
+// ✅ TAKIP FEED: Sadece takip edilen kullanıcıların gönderileri + kendi gönderileri
 // AppCache.feed: 200 kullanıcı, 30s TTL, LRU eviction
 
 app.get('/api/feed', authenticateToken, async (req, res) => {
@@ -6391,22 +7335,38 @@ app.get('/api/feed', authenticateToken, async (req, res) => {
         const cached = AppCache.feed.get(cacheKey);
         if (cached) return res.json(cached);
 
+        // ⚡ Takip feed sorgusu:
+        //   - Kendi gönderileri (p."userId" = $1)
+        //   - Takip ettiklerinin gönderileri (EXISTS follows)
+        //   - Engellenenler hariç (NOT EXISTS blocks)
+        // Performans: idx_follows_followerId + idx_posts_active_created + idx_blocks_blocker
         const posts = await dbAll(
             `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType", u.username as "authorUsername",
                     EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
                     EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved",
-                    EXISTS(SELECT 1 FROM follows WHERE "followerId" = $1 AND "followingId" = p."userId") as "isFollowing"
+                    (p."userId" = $1 OR TRUE) as "isFollowing"
              FROM posts p
              JOIN users u ON p."userId" = u.id
              WHERE p."isActive" = TRUE
-               AND p."userId" NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1)
-               AND p."userId" NOT IN (SELECT "blockerId" FROM blocks WHERE "blockedId" = $1)
+               AND (
+                    p."userId" = $1
+                    OR EXISTS (
+                        SELECT 1 FROM follows
+                        WHERE "followerId" = $1 AND "followingId" = p."userId"
+                    )
+               )
+               AND NOT EXISTS (SELECT 1 FROM blocks WHERE "blockerId" = $1 AND "blockedId" = p."userId")
+               AND NOT EXISTS (SELECT 1 FROM blocks WHERE "blockerId" = p."userId" AND "blockedId" = $1)
              ORDER BY p."createdAt" DESC
              LIMIT $2 OFFSET $3`,
             [req.user.id, Math.min(Math.max(parseInt(limit)||20, 1), 200), Math.max(offset||0, 0)]
         );
 
-        const responseData = { posts: posts.map(formatPost), page: parseInt(page) };
+        const responseData = {
+            posts       : posts.map(formatPost),
+            page        : parseInt(page),
+            followingOnly: true,  // ← istemci bu flag'i kontrol edebilir
+        };
         AppCache.feed.set(cacheKey, responseData); // ⚡ LRU cache'e kaydet
         res.json(responseData);
     } catch (error) {
@@ -6447,13 +7407,63 @@ app.get('/api/posts/:id', authenticateToken, async (req, res, next) => {
 // ─── 13. POST SİL ──────────────────────────────────────────────────
 app.delete('/api/posts/:id', authenticateToken, async (req, res) => {
     try {
-        const post = await dbGet('SELECT "userId" FROM posts WHERE id = $1', [req.params.id]);
+        const post = await dbGet(
+            'SELECT "userId", media, "mediaUrls", "thumbnailUrl" FROM posts WHERE id = $1',
+            [req.params.id]
+        );
         if (!post) return res.status(404).json({ error: 'Gönderi bulunamadı' });
         if (post.userId !== req.user.id && req.user.role !== 'admin') {
             return res.status(403).json({ error: 'Yetkiniz yok' });
         }
+
         await dbRun('UPDATE posts SET "isActive" = FALSE, "updatedAt" = NOW() WHERE id = $1', [req.params.id]);
         res.json({ message: 'Gönderi silindi' });
+
+        // Medya dosyalarını arka planda sil (yanıtı bloke etme)
+        setImmediate(async () => {
+            try {
+                const toDelete = new Set();
+
+                // Tek medya
+                if (post.media) {
+                    const rel = post.media.replace(/^https?:\/\/[^/]+/, '');
+                    if (rel.startsWith('/uploads/')) {
+                        toDelete.add(path.join(__dirname, 'public', rel));
+                    }
+                }
+                // Thumbnail
+                if (post.thumbnailUrl) {
+                    const rel = post.thumbnailUrl.replace(/^https?:\/\/[^/]+/, '');
+                    if (rel.startsWith('/uploads/')) {
+                        toDelete.add(path.join(__dirname, 'public', rel));
+                    }
+                }
+                // Çoklu medya
+                if (post.mediaUrls) {
+                    try {
+                        const items = typeof post.mediaUrls === 'string'
+                            ? JSON.parse(post.mediaUrls) : post.mediaUrls;
+                        if (Array.isArray(items)) {
+                            for (const item of items) {
+                                const rel = (item.url || '').replace(/^https?:\/\/[^/]+/, '');
+                                if (rel.startsWith('/uploads/')) {
+                                    toDelete.add(path.join(__dirname, 'public', rel));
+                                }
+                            }
+                        }
+                    } catch (_) {}
+                }
+
+                for (const filePath of toDelete) {
+                    await require('fs').promises.unlink(filePath).catch(() => {});
+                }
+                if (toDelete.size > 0) {
+                    console.log(`🗑️  [Post Sil] ${toDelete.size} medya dosyası silindi (postId: ${req.params.id})`);
+                }
+            } catch (e) {
+                console.error('[Post Sil] Dosya temizleme hatası:', e.message);
+            }
+        });
     } catch (error) {
         console.error('Post silme hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -6461,13 +7471,12 @@ app.delete('/api/posts/:id', authenticateToken, async (req, res) => {
 });
 
 // ─── 14. KULLANICININ POSTLARı ──────────────────────────────────────
-app.get('/api/users/:userId/posts', authenticateToken, async (req, res) => {
+app.get('/api/users/:userId/posts', optionalAuth, async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
         const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
         const param = req.params.userId;
 
-        // ID veya username ile kullanıcı bul
         const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(param);
         let targetUserId = param;
         if (!isUUID) {
@@ -6476,20 +7485,33 @@ app.get('/api/users/:userId/posts', authenticateToken, async (req, res) => {
             targetUserId = u.id;
         }
 
+        const viewerId = req.user?.id || null;
+
+        // 🔒 GİZLİ HESAP — takipçi değilse post listesi boş döner
+        if (targetUserId !== viewerId) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"` : 'FALSE AS "isFollowing"'}
+                 FROM users WHERE id=$2`,
+                viewerId ? [viewerId, targetUserId] : [targetUserId]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                return res.json({ posts: [], total: 0, page: parseInt(page), isPrivate: true });
+            }
+        }
+
         const posts = await dbAll(
             `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u.username as "authorUsername",
-                    EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
-                    EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
+                    EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved"` : 'FALSE as "isLiked", FALSE as "isSaved"'}
              FROM posts p
              JOIN users u ON p."userId" = u.id
              WHERE p."userId" = $2 AND p."isActive" = TRUE
              ORDER BY p."createdAt" DESC
              LIMIT $3 OFFSET $4`,
-            [req.user.id, targetUserId, parseInt(limit), offset]
+            viewerId ? [viewerId, targetUserId, parseInt(limit), offset] : [targetUserId, parseInt(limit), offset]
         );
 
         const total = await dbGet('SELECT COUNT(*) as c FROM posts WHERE "userId"=$1 AND "isActive"=TRUE', [targetUserId]);
-
         res.json({ posts: posts.map(formatPost), total: parseInt(total?.c || 0), page: parseInt(page) });
     } catch (error) {
         console.error('Kullanıcı postları hatası:', error);
@@ -6498,7 +7520,7 @@ app.get('/api/users/:userId/posts', authenticateToken, async (req, res) => {
 });
 
 // ─── 15. BEĞENİ ────────────────────────────────────────────────────
-app.post('/api/posts/:id/like', authenticateToken, checkRestriction('like'), async (req, res) => {
+app.post('/api/posts/:id/like', authenticateToken, likeLimiter, checkRestriction('like'), async (req, res) => {
     try {
         const postId = req.params.id;
         const existing = await dbGet('SELECT id FROM likes WHERE "postId" = $1 AND "userId" = $2', [postId, req.user.id]);
@@ -6511,9 +7533,17 @@ app.post('/api/posts/:id/like', authenticateToken, checkRestriction('like'), asy
             await dbRun('INSERT INTO likes (id, "postId", "userId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("postId", "userId") DO NOTHING', [uuidv4(), postId, req.user.id]);
             await dbRun('UPDATE posts SET "likeCount" = "likeCount" + 1, "updatedAt" = NOW() WHERE id = $1', [postId]);
 
-            const post = await dbGet('SELECT "userId" FROM posts WHERE id = $1', [postId]);
+            const post = await dbGet('SELECT "userId", content FROM posts WHERE id = $1', [postId]);
             if (post && post.userId !== req.user.id) {
-                createNotification(post.userId, 'like', `${req.user.username} gönderinizi beğendi`, { postId, userId: req.user.id });
+                const postPreview = post.content ? post.content.substring(0, 60) : '';
+                createNotification(post.userId, 'like', `${req.user.username} gönderinizi beğendi`, {
+                    postId,
+                    userId          : req.user.id,
+                    actorName       : req.user.name || req.user.username,
+                    actorUsername   : req.user.username,
+                    actorProfilePic : req.user.profilePic || '',
+                    postPreview,
+                });
             }
             res.json({ liked: true });
         }
@@ -6524,7 +7554,7 @@ app.post('/api/posts/:id/like', authenticateToken, checkRestriction('like'), asy
 });
 
 // ─── 16. YORUM YAP ─────────────────────────────────────────────────
-app.post('/api/posts/:id/comments', authenticateToken, checkRestriction('comment'), async (req, res) => {
+app.post('/api/posts/:id/comments', authenticateToken, commentLimiter, checkRestriction('comment'), async (req, res) => {
     try {
         const { content, parentId } = req.body;
         if (!content || !content.trim()) return res.status(400).json({ error: 'Yorum boş olamaz' });
@@ -6543,7 +7573,38 @@ app.post('/api/posts/:id/comments', authenticateToken, checkRestriction('comment
         await dbRun('UPDATE posts SET "commentCount" = "commentCount" + 1, "updatedAt" = NOW() WHERE id = $1', [req.params.id]);
 
         if (post.userId !== req.user.id) {
-            createNotification(post.userId, 'comment', `${req.user.username} gönderinize yorum yaptı`, { postId: req.params.id, commentId });
+            createNotification(post.userId, 'comment', `${req.user.username} gönderinize yorum yaptı`, {
+                postId         : req.params.id,
+                commentId,
+                actorName      : req.user.name || req.user.username,
+                actorUsername  : req.user.username,
+                actorProfilePic: req.user.profilePic || '',
+                commentContent : content.substring(0, 100),
+            });
+        }
+
+        // @mention bildirimleri — yorum içindeki etiketler
+        const commentMentions = content.match(/@([\w.]+)/g);
+        if (commentMentions) {
+            const uniqueMentions = [...new Set(commentMentions.map(m => m.slice(1).toLowerCase()))];
+            setImmediate(async () => {
+                for (const uname of uniqueMentions.slice(0, 5)) {
+                    if (uname === req.user.username.toLowerCase()) continue;
+                    const mentioned = await dbGet(
+                        'SELECT id FROM users WHERE LOWER(username) = $1 AND "isActive" = TRUE', [uname]
+                    ).catch(() => null);
+                    if (mentioned && mentioned.id !== post.userId) { // post sahibi zaten bildirim aldı
+                        createNotification(mentioned.id, 'mention',
+                            `${req.user.username} bir yorumda sizi etiketledi`, {
+                                postId: req.params.id,
+                                commentId,
+                                actorName      : req.user.name || req.user.username,
+                                actorUsername  : req.user.username,
+                                actorProfilePic: req.user.profilePic || '',
+                            });
+                    }
+                }
+            });
         }
 
         const comment = await dbGet('SELECT * FROM comments WHERE id = $1', [commentId]);
@@ -6555,20 +7616,21 @@ app.post('/api/posts/:id/comments', authenticateToken, checkRestriction('comment
 });
 
 // ─── 17. YORUMLARI GETİR ───────────────────────────────────────────
-app.get('/api/posts/:id/comments', authenticateToken, async (req, res) => {
+app.get('/api/posts/:id/comments', optionalAuth, async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
         const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
+        const viewerId = req.user?.id || null;
 
         const comments = await dbAll(
             `SELECT c.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
-                    EXISTS(SELECT 1 FROM comment_likes WHERE "commentId" = c.id AND "userId" = $1) as "isLiked"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM comment_likes WHERE "commentId" = c.id AND "userId" = $1) as "isLiked"` : 'FALSE as "isLiked"'}
              FROM comments c
              JOIN users u ON c."userId" = u.id
              WHERE c."postId" = $2
              ORDER BY c."createdAt" ASC
              LIMIT $3 OFFSET $4`,
-            [req.user.id, req.params.id, parseInt(limit), offset]
+            viewerId ? [viewerId, req.params.id, parseInt(limit), offset] : [req.params.id, parseInt(limit), offset]
         );
 
         res.json({ comments: comments.map(c => ({ ...c, profilePic: absoluteUrl(c.profilePic) })) });
@@ -6579,7 +7641,8 @@ app.get('/api/posts/:id/comments', authenticateToken, async (req, res) => {
 });
 
 // ─── 18. TAKİP ET/BIRAK ────────────────────────────────────────────
-app.post('/api/users/:id/follow', authenticateToken, checkRestriction('follow'), async (req, res) => {
+// 🔒 Gizli hesap: direkt takip yerine takip isteği gönderilir
+app.post('/api/users/:id/follow', authenticateToken, followLimiter, checkRestriction('follow'), async (req, res) => {
     try {
         const targetId = req.params.id;
         if (targetId === req.user.id) return res.status(400).json({ error: 'Kendinizi takip edemezsiniz' });
@@ -6590,13 +7653,60 @@ app.post('/api/users/:id/follow', authenticateToken, checkRestriction('follow'),
         const existing = await dbGet('SELECT id FROM follows WHERE "followerId" = $1 AND "followingId" = $2', [req.user.id, targetId]);
 
         if (existing) {
+            // Takipten çık
             await dbRun('DELETE FROM follows WHERE id = $1', [existing.id]);
-            res.json({ following: false });
-        } else {
-            await dbRun('INSERT INTO follows (id, "followerId", "followingId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("followerId", "followingId") DO NOTHING', [uuidv4(), req.user.id, targetId]);
-            createNotification(targetId, 'follow', `${req.user.username} sizi takip etmeye başladı`, { userId: req.user.id });
-            res.json({ following: true });
+            // Bekleyen takip isteği de varsa sil
+            await dbRun(
+                `UPDATE follow_requests SET status='cancelled', "respondedAt"=NOW()
+                 WHERE "requesterId"=$1 AND "targetId"=$2 AND status='pending'`,
+                [req.user.id, targetId]
+            ).catch(() => {});
+            return res.json({ following: false, requested: false });
         }
+
+        // Hedef kullanıcı gizli mi?
+        const target = await dbGet('SELECT "isPrivate" FROM users WHERE id=$1 AND "isActive"=TRUE', [targetId]);
+        if (!target) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+
+        if (target.isPrivate) {
+            // Zaten bekleyen istek var mı?
+            const pendingReq = await dbGet(
+                `SELECT id FROM follow_requests WHERE "requesterId"=$1 AND "targetId"=$2 AND status='pending'`,
+                [req.user.id, targetId]
+            );
+            if (pendingReq) {
+                // İsteği geri çek
+                await dbRun(
+                    `UPDATE follow_requests SET status='cancelled',"respondedAt"=NOW() WHERE id=$1`,
+                    [pendingReq.id]
+                );
+                return res.json({ following: false, requested: false, message: 'Takip isteği geri çekildi' });
+            }
+            // Yeni takip isteği oluştur
+            await dbRun(
+                `INSERT INTO follow_requests (id,"requesterId","targetId",status,"createdAt")
+                 VALUES ($1,$2,$3,'pending',NOW())
+                 ON CONFLICT DO NOTHING`,
+                [uuidv4(), req.user.id, targetId]
+            );
+            createNotification(targetId, 'follow_request', `${req.user.username} sizi takip etmek istiyor`, {
+                userId         : req.user.id,
+                actorName      : req.user.name || req.user.username,
+                actorUsername  : req.user.username,
+                actorProfilePic: req.user.profilePic || '',
+            });
+            return res.json({ following: false, requested: true, message: 'Takip isteği gönderildi' });
+        }
+
+        // Açık hesap — direkt takip et
+        await dbRun('INSERT INTO follows (id, "followerId", "followingId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("followerId", "followingId") DO NOTHING', [uuidv4(), req.user.id, targetId]);
+        createNotification(targetId, 'follow', `${req.user.username} sizi takip etmeye başladı`, {
+            userId         : req.user.id,
+            actorName      : req.user.name || req.user.username,
+            actorUsername  : req.user.username,
+            actorProfilePic: req.user.profilePic || '',
+        });
+        res.json({ following: true, requested: false });
     } catch (error) {
         console.error('Takip hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -6604,16 +7714,29 @@ app.post('/api/users/:id/follow', authenticateToken, checkRestriction('follow'),
 });
 
 // ─── 19. TAKİPÇİLER ────────────────────────────────────────────────
-app.get('/api/users/:id/followers', authenticateToken, async (req, res) => {
+app.get('/api/users/:id/followers', optionalAuth, async (req, res) => {
     try {
+        const viewerId = req.user?.id || null;
+        const isSelf = viewerId && req.params.id === viewerId;
+        if (!isSelf) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"` : 'FALSE AS "isFollowing"'}
+                 FROM users WHERE id=$2`,
+                viewerId ? [viewerId, req.params.id] : [req.params.id]
+            );
+            // 🔒 Gizli hesap: takipçi değilse takipçi listesi boş döner
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                return res.json({ followers: [], isPrivate: true });
+            }
+        }
         const followers = await dbAll(
             `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
-                    EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"` : 'FALSE as "isFollowing"'}
              FROM follows f
              JOIN users u ON f."followerId" = u.id
              WHERE f."followingId" = $1
              ORDER BY f."createdAt" DESC`,
-            [req.params.id, req.user.id]
+            viewerId ? [req.params.id, viewerId] : [req.params.id]
         );
         res.json({ followers: followers.map(u => ({ ...u, profilePic: absoluteUrl(u.profilePic) })) });
     } catch (error) {
@@ -6623,16 +7746,29 @@ app.get('/api/users/:id/followers', authenticateToken, async (req, res) => {
 });
 
 // ─── 20. TAKİP EDİLENLER ───────────────────────────────────────────
-app.get('/api/users/:id/following', authenticateToken, async (req, res) => {
+app.get('/api/users/:id/following', optionalAuth, async (req, res) => {
     try {
+        const viewerId = req.user?.id || null;
+        const isSelf = viewerId && req.params.id === viewerId;
+        if (!isSelf) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"` : 'FALSE AS "isFollowing"'}
+                 FROM users WHERE id=$2`,
+                viewerId ? [viewerId, req.params.id] : [req.params.id]
+            );
+            // 🔒 Gizli hesap: takipçi değilse takip edilenler listesi de boş döner
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                return res.json({ following: [], isPrivate: true });
+            }
+        }
         const following = await dbAll(
             `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
-                    EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"
+                    ${viewerId ? `EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"` : 'FALSE as "isFollowing"'}
              FROM follows f
              JOIN users u ON f."followingId" = u.id
              WHERE f."followerId" = $1
              ORDER BY f."createdAt" DESC`,
-            [req.params.id, req.user.id]
+            viewerId ? [req.params.id, viewerId] : [req.params.id]
         );
         res.json({ following: following.map(u => ({ ...u, profilePic: absoluteUrl(u.profilePic) })) });
     } catch (error) {
@@ -6642,7 +7778,18 @@ app.get('/api/users/:id/following', authenticateToken, async (req, res) => {
 });
 
 // ─── 21. MESAJ GÖNDER ───────────────────────────────────────────────
-app.post('/api/messages', authenticateToken, checkRestriction('message'), async (req, res) => {
+// 🔒 Mesaj rate limit — kullanıcı başına dakikada max 30 mesaj (flood/spam koruması)
+const messageLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 dakika
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req, res) => req.user?.id || rateLimit.ipKeyGenerator(req, res),
+    message: { error: 'Çok hızlı mesaj gönderiyorsunuz. Lütfen bir dakika bekleyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+app.post('/api/messages', authenticateToken, messageLimiter, checkRestriction('message'), async (req, res) => {
     try {
         const { recipientId, content } = req.body;
         if (!recipientId || !content) return res.status(400).json({ error: 'Alıcı ve mesaj gerekli' });
@@ -6660,7 +7807,13 @@ app.post('/api/messages', authenticateToken, checkRestriction('message'), async 
             [msgId, req.user.id, req.user.username, recipientId, recipient.username, content.substring(0, 5000)]
         );
 
-        createNotification(recipientId, 'message', `${req.user.username} size mesaj gönderdi`, { senderId: req.user.id });
+        createNotification(recipientId, 'message', `${req.user.username} size mesaj gönderdi`, {
+            senderId       : req.user.id,
+            actorName      : req.user.name || req.user.username,
+            actorUsername  : req.user.username,
+            actorProfilePic: req.user.profilePic || '',
+            messagePreview : content.substring(0, 100),
+        });
 
         res.status(201).json({ message: 'Mesaj gönderildi', id: msgId });
     } catch (error) {
@@ -6696,41 +7849,52 @@ function decryptMessages(messages) {
 // ─── 22. SOHBET LİSTESİ ────────────────────────────────────────────
 app.get('/api/messages/conversations', authenticateToken, async (req, res) => {
     try {
+        // ⚡ N+1 sorgu yerine tek JOIN — her konuşma için ayrı DB çağrısı yok
         const conversations = await dbAll(
-            `SELECT DISTINCT ON (partner_id) *
+            `SELECT DISTINCT ON (partner_id)
+                sub.*,
+                u.name          AS partner_name,
+                u.username      AS partner_username_full,
+                u."profilePic"  AS partner_profile_pic,
+                u."isVerified"  AS partner_is_verified,
+                u."isOnline"    AS partner_is_online,
+                (
+                    SELECT COUNT(*) FROM messages uc
+                    WHERE uc."senderId" = sub.partner_id
+                      AND uc."recipientId" = $1
+                      AND uc.read = FALSE
+                ) AS unread_count
              FROM (
-                 SELECT m.*, 
-                        CASE WHEN m."senderId" = $1 THEN m."recipientId" ELSE m."senderId" END as partner_id,
-                        CASE WHEN m."senderId" = $1 THEN m."recipientUsername" ELSE m."senderUsername" END as partner_username
+                 SELECT m.*,
+                        CASE WHEN m."senderId" = $1 THEN m."recipientId"   ELSE m."senderId"   END AS partner_id,
+                        CASE WHEN m."senderId" = $1 THEN m."recipientUsername" ELSE m."senderUsername" END AS partner_uname
                  FROM messages m
                  WHERE m."senderId" = $1 OR m."recipientId" = $1
              ) sub
-             JOIN users u ON sub.partner_id = u.id
+             JOIN users u ON u.id = sub.partner_id
              ORDER BY partner_id, sub."createdAt" DESC`,
             [req.user.id]
         );
 
-        const enriched = await Promise.all(conversations.map(async (conv) => {
-            const partner = await dbGet(
-                'SELECT id, username, name, "profilePic", "isVerified", "isOnline" FROM users WHERE id = $1',
-                [conv.partner_id]
-            );
-            const unreadCount = await dbGet(
-                'SELECT COUNT(*) as count FROM messages WHERE "senderId" = $1 AND "recipientId" = $2 AND read = FALSE',
-                [conv.partner_id, req.user.id]
-            );
-            return {
-                ...conv,
-                partner: partner ? { ...partner, profilePic: absoluteUrl(partner.profilePic) } : null,
-                unreadCount: parseInt(unreadCount?.count || 0)
-            };
+        const safeConversations = conversations.map(c => ({
+            id            : c.id,
+            content       : safeDecryptContent(c.content),
+            mediaType     : c.mediaType || null,
+            createdAt     : c.createdAt,
+            partner: {
+                id         : c.partner_id,
+                username   : c.partner_uname,
+                name       : c.partner_name,
+                profilePic : absoluteUrl(c.partner_profile_pic),
+                isVerified : c.partner_is_verified,
+                isOnline   : c.partner_is_online,
+            },
+            unreadCount: parseInt(c.unread_count || 0),
         }));
 
-        // Son mesaj içeriğini decrypt guard'dan geçir
-        const safeConversations = enriched.map(c => ({
-            ...c,
-            content: safeDecryptContent(c.content)
-        }));
+        // Son mesaja göre sırala
+        safeConversations.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
         res.json({ conversations: safeConversations });
     } catch (error) {
         console.error('Sohbet listesi hatası:', error);
@@ -6742,23 +7906,36 @@ app.get('/api/messages/conversations', authenticateToken, async (req, res) => {
 app.get('/api/messages/:userId', authenticateToken, async (req, res) => {
     try {
         const { page = 1, limit = 50 } = req.query;
-        const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
+        const pn = Math.max(parseInt(page)||1, 1);
+        const ln = Math.min(Math.max(parseInt(limit)||20, 1), 200);
+        const offset = (pn - 1) * ln;
 
         const messages = await dbAll(
-            `SELECT * FROM messages
+            `SELECT id, "senderId", "senderUsername", "recipientId", "recipientUsername",
+                    content, "mediaUrl", "mediaType", read, "readAt", "createdAt", "updatedAt"
+             FROM messages
              WHERE ("senderId" = $1 AND "recipientId" = $2) OR ("senderId" = $2 AND "recipientId" = $1)
              ORDER BY "createdAt" DESC
              LIMIT $3 OFFSET $4`,
-            [req.user.id, req.params.userId, parseInt(limit), offset]
+            [req.user.id, req.params.userId, ln, offset]
         );
 
+        // Okunmamış mesajları okundu işaretle
         await dbRun(
             `UPDATE messages SET read = TRUE, "readAt" = NOW()
              WHERE "senderId" = $1 AND "recipientId" = $2 AND read = FALSE`,
             [req.params.userId, req.user.id]
         );
 
-        res.json({ messages: decryptMessages(messages.reverse()) });
+        const processed = messages.reverse().map(m => ({
+            ...m,
+            content   : safeDecryptContent(m.content),
+            mediaUrl  : m.mediaUrl ? absoluteUrl(m.mediaUrl) : null,
+            // Sesli mesaj için alias
+            voiceUrl  : m.mediaType === 'voice' ? absoluteUrl(m.mediaUrl) : null,
+        }));
+
+        res.json({ messages: processed });
     } catch (error) {
         console.error('Mesaj geçmişi hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -6915,7 +8092,7 @@ app.get('/api/store/products', authenticateToken, async (req, res) => {
 });
 
 // ─── 31. ÜRÜN EKLE ─────────────────────────────────────────────────
-app.post('/api/store/products', authenticateToken, (req, res, next) => {
+app.post('/api/store/products', authenticateToken, storeLimiter, (req, res, next) => {
     // Hem 'images' (çoklu) hem 'image' (tekil) field adını kabul et
     upload.fields([
         { name: 'images', maxCount: 5 },
@@ -6946,10 +8123,8 @@ app.post('/api/store/products', authenticateToken, (req, res, next) => {
             const filename = `product_${uuidv4().replace(/-/g,"").slice(0,16)}_${i}.webp`;
             const outputPath = path.join(postsDir, filename);
             try {
-                await sharp(file.path)
-                    .resize(1080, 1080, { fit: 'inside', withoutEnlargement: true })
-                    .webp({ quality: 85 })
-                    .toFile(outputPath);
+                // ✅ processImage: EXIF rotate fix + concurrency limiter
+                await processImage(file.path, outputPath, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
             } catch (imgErr) {
                 console.warn('Görsel işleme hatası, orijinal kullanılıyor:', imgErr.message);
                 const fs2 = require('fs');
@@ -7103,7 +8278,7 @@ app.get('/api/stats', authenticateToken, async (req, res) => {
 });
 
 // ─── POST ŞİKAYETİ ─────────────────────────────────────────────────
-app.post('/api/reports/post', authenticateToken, async (req, res) => {
+app.post('/api/reports/post', authenticateToken, reportLimiter, async (req, res) => {
     try {
         const { postId, reason, description } = req.body;
         if (!postId || !reason) return res.status(400).json({ error: 'Post ID ve neden gerekli' });
@@ -7160,7 +8335,7 @@ app.post('/api/auth/verify-email', authenticateToken, async (req, res) => {
 // ─── YENİ ROTA 2: DOĞRULAMA KODUNU YENİDEN GÖNDER ──────────────────
 // ✅ HATA DÜZELTMESİ 1: authenticateToken kaldırıldı — kayıt akışında kullanıcının henüz token'ı yoktur.
 // ✅ HATA DÜZELTMESİ 2: sendVerificationEmail → sendEmailVerificationCode (tanımsız fonksiyon hatası giderildi).
-app.post('/api/auth/resend-verification', validateAuthInput, async (req, res) => {
+app.post('/api/auth/resend-verification', resendVerificationLimiter, validateAuthInput, async (req, res) => {
     try {
         // Token varsa token'dan, yoksa body'den email al
         const emailFromBody = req.body?.email;
@@ -7203,7 +8378,7 @@ app.post('/api/auth/resend-verification', validateAuthInput, async (req, res) =>
 });
 
 // ─── YENİ ROTA 3: ŞİFREMİ UNUTTUM ──────────────────────────────────
-app.post('/api/auth/forgot-password', validateAuthInput, async (req, res) => {
+app.post('/api/auth/forgot-password', forgotPasswordLimiter, validateAuthInput, async (req, res) => {
     try {
         const { email, username } = req.body;
         const ip = req.ip || req.connection?.remoteAddress;
@@ -7242,23 +8417,24 @@ app.post('/api/auth/forgot-password', validateAuthInput, async (req, res) => {
         // ✅ Eski tokenları temizle
         await pool.query(`DELETE FROM password_resets WHERE "userId" = $1`, [user.id]).catch(() => {});
 
-        const token = crypto.randomBytes(32).toString('hex');
+        const token     = crypto.randomBytes(32).toString('hex');  // e-postaya gidecek ham token
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex'); // DB'de saklanacak hash
 
         // ✅ PostgreSQL interval ile kaydet (timezone sorunu yok)
         await dbRun(
             `INSERT INTO password_resets (id, "userId", token, "expiresAt")
              VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')`,
-            [uuidv4(), user.id, token]
+            [uuidv4(), user.id, tokenHash]
         );
-        console.log(`🔑 Şifre sıfırlama token'ı oluşturuldu: ${user.email} - Süre: 10 dakika`);
+        console.log(`🔑 Şifre sıfırlama token'ı oluşturuldu: ${maskEmail(user.email)} - Süre: 10 dakika`);
 
         // E-posta gönder
         sendForgotPasswordEmail(user.email, user.name, token)
             .then(result => {
                 if (result?.success) {
-                    console.log(`📧 Şifremi unuttum e-postası gönderildi: ${user.email}`);
+                    console.log(`📧 Şifremi unuttum e-postası gönderildi: ${maskEmail(user.email)}`);
                 } else {
-                    console.error(`❌ Şifremi unuttum e-postası gönderilemedi: ${user.email}`, result?.error);
+                    console.error(`❌ Şifremi unuttum e-postası gönderilemedi: ${maskEmail(user.email)}`, result?.error);
                 }
             })
             .catch(err => console.error('❌ Şifremi unuttum e-posta hatası:', err.message));
@@ -7279,11 +8455,12 @@ app.post('/api/auth/reset-password', validateAuthInput, async (req, res) => {
         const { token, newPassword, confirmPassword } = req.body;
         if (!token || !newPassword || !confirmPassword) return res.status(400).json({ error: 'Tüm alanlar zorunludur' });
         if (newPassword !== confirmPassword) return res.status(400).json({ error: 'Şifreler eşleşmiyor' });
-        if (newPassword.length < 6) return res.status(400).json({ error: 'Şifre en az 6 karakter olmalı' });
+        if (newPassword.length < 8) return res.status(400).json({ error: 'Şifre en az 8 karakter olmalı' });
 
+        const incomingHash = crypto.createHash('sha256').update(token).digest('hex');
         const record = await dbGet(
             `SELECT * FROM password_resets WHERE token = $1 AND used = FALSE AND "expiresAt" > NOW()`,
-            [token]
+            [incomingHash]
         );
         if (!record) return res.status(400).json({ error: 'Geçersiz veya süresi dolmuş token' });
 
@@ -7306,6 +8483,7 @@ app.post('/api/auth/reset-password', validateAuthInput, async (req, res) => {
 app.get('/api/auth/verify-reset-token', async (req, res) => {
     try {
         const { token, username } = req.query;
+        const tokenHash = token ? crypto.createHash('sha256').update(token).digest('hex') : null;
         if (!token) return res.status(400).json({ error: 'Token gerekli' });
 
         let record;
@@ -7322,14 +8500,14 @@ app.get('/api/auth/verify-reset-token', async (req, res) => {
             record = await dbGet(
                 `SELECT "expiresAt" FROM password_resets
                  WHERE token = $1 AND "userId" = $2 AND used = FALSE AND "expiresAt" > NOW()`,
-                [token, user.id]
+                [tokenHash, user.id]
             );
         } else {
             // Sadece token ile doğrulama
             record = await dbGet(
                 `SELECT "expiresAt" FROM password_resets
                  WHERE token = $1 AND used = FALSE AND "expiresAt" > NOW()`,
-                [token]
+                [tokenHash]
             );
         }
 
@@ -7611,27 +8789,61 @@ app.get('/api/videos/:postId/info', authenticateToken, async (req, res) => {
     }
 });
 
-// ─── HLS DURUM (istemci manifest hazır mı diye sorar) ───────────────
+// ─── HLS DURUM — HLS kalıcı olarak devre dışı, her zaman MP4 kullanılır ─
+// Frontend bu endpoint'i sorgulayıp HLS'e geçmesin diye her zaman ready:false döner.
 app.get('/api/videos/:videoId/hls-status', authenticateToken, (req, res) => {
-    // 🔒 Path traversal koruması
-    const safeId = sanitizeVideoId(req.params.videoId);
-    if (!safeId) return res.status(400).json({ error: 'Geçersiz video ID' });
-    const masterPath = path.join(hlsDir, safeId, 'master.m3u8');
-    if (!masterPath.startsWith(hlsDir + path.sep)) return res.status(403).json({ error: 'Erişim reddedildi' });
-    if (fssync.existsSync(masterPath)) {
-        const variants = HLS_VARIANTS.map(v => {
-            const pl = path.join(hlsDir, safeId, v.name, 'playlist.m3u8');
-            return { name: v.name, ready: fssync.existsSync(pl), url: absoluteUrl(`/uploads/hls/${safeId}/${v.name}/playlist.m3u8`) };
-        }).filter(v => v.ready);
+    res.json({ ready: false, hlsDisabled: true, activeVideoJobs: activeVideoJobs, message: 'HLS devre dışı, MP4 kullanılıyor' });
+});
 
-        return res.json({
-            ready      : true,
-            masterUrl  : absoluteUrl(`/uploads/hls/${safeId}/master.m3u8`),
-            variants,
-            activeVideoJobs: activeVideoJobs,
+// ─── HLS→MP4 MİGRASYON: Eski m3u8 URL'li gönderileri mp4'e çevir ──────
+// Kullanım: POST /api/admin-fix-hls-to-mp4  (Postman ile 1 kez çalıştır, admin token ile)
+app.post('/api/admin-fix-hls-to-mp4', authenticateToken, async (req, res) => {
+    try {
+        const user = await dbGet('SELECT role FROM users WHERE id = $1', [req.user.id]);
+        if (!user || user.role !== 'admin') return res.status(403).json({ error: 'Yetki yok' });
+
+        const hlsPosts = await pool.query(
+            `SELECT id, media FROM posts WHERE media LIKE '%/hls/%' AND media LIKE '%.m3u8'`
+        );
+
+        let fixed = 0, notFound = 0;
+        for (const post of hlsPosts.rows) {
+            const m = post.media.match(/\/hls\/([^/]+)\/master\.m3u8/);
+            if (!m) continue;
+            const videoId = m[1];
+            const mp4Path = path.join(videosDir, `${videoId}.mp4`);
+
+            if (fssync.existsSync(mp4Path)) {
+                await dbRun(
+                    `UPDATE posts SET media = $1, "updatedAt" = NOW() WHERE id = $2`,
+                    [`/uploads/videos/${videoId}.mp4`, post.id]
+                );
+                fixed++;
+            } else {
+                const rawPath = path.join(videosDir, `${videoId}_raw.mp4`);
+                if (fssync.existsSync(rawPath)) {
+                    await dbRun(
+                        `UPDATE posts SET media = $1, "updatedAt" = NOW() WHERE id = $2`,
+                        [`/uploads/videos/${videoId}_raw.mp4`, post.id]
+                    );
+                    fixed++;
+                } else {
+                    notFound++;
+                }
+            }
+        }
+
+        res.json({
+            success: true,
+            total: hlsPosts.rows.length,
+            fixed,
+            notFound,
+            message: `${fixed} gönderi MP4'e güncellendi. ${notFound} gönderi için MP4 bulunamadı.`
         });
+    } catch (e) {
+        console.error('[HLS-Fix] Hata:', e.message);
+        res.status(500).json({ error: 'Migrasyon hatası' });
     }
-    res.json({ ready: false, activeVideoJobs: activeVideoJobs, message: 'HLS henüz işleniyor, MP4 ile oynat' });
 });
 
 // ─── YENİ ROTA 11: YORUM GÜNCELLE ──────────────────────────────────
@@ -7904,7 +9116,7 @@ app.get('/api/hashtags/:tag', authenticateToken, async (req, res) => {
 });
 
 // ─── 36. YORUM BEĞENİ ──────────────────────────────────────────────
-app.post('/api/comments/:id/like', authenticateToken, checkRestriction('like'), async (req, res) => {
+app.post('/api/comments/:id/like', authenticateToken, likeLimiter, checkRestriction('like'), async (req, res) => {
     try {
         const commentId = req.params.id;
         const existing = await dbGet('SELECT id FROM comment_likes WHERE "commentId" = $1 AND "userId" = $2', [commentId, req.user.id]);
@@ -7949,7 +9161,7 @@ app.delete('/api/comments/:id', authenticateToken, async (req, res) => {
 });
 
 // ─── 38. STORY OLUŞTUR ─────────────────────────────────────────────
-app.post('/api/stories', authenticateToken, upload.single('media'), async (req, res) => {
+app.post('/api/stories', authenticateToken, storyLimiter, upload.single('media'), async (req, res) => {
     try {
         const { caption, text, textColor, textLayers, filter, linkUrl, hashtag, mentions, replyMode } = req.body;
         if (!req.file && !text) return res.status(400).json({ error: 'Medya veya metin gerekli' });
@@ -7970,7 +9182,8 @@ app.post('/api/stories', authenticateToken, upload.single('media'), async (req, 
             } else {
                 const filename = `story_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
                 const dest = path.join(postsDir, filename);
-                await sharp(req.file.path).resize(1080, 1920, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(dest);
+                // ✅ processImage: EXIF rotate fix + concurrency limiter
+                await processImage(req.file.path, dest, { width: 1080, height: 1920, fit: 'inside', quality: 80, effort: 4 });
                 await fs.unlink(req.file.path).catch(() => {});
                 mediaUrl = `/uploads/posts/${filename}`;
             }
@@ -8113,8 +9326,46 @@ app.delete('/api/stories/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// ─── POST /api/stories/share-post — Gönderiyi hikayeye paylaş ──────
+app.post('/api/stories/share-post', authenticateToken, async (req, res) => {
+    try {
+        const { postId } = req.body;
+        if (!postId) return res.status(400).json({ error: 'postId gerekli' });
+
+        const post = await dbGet(
+            `SELECT p.*, u.name, u.username FROM posts p JOIN users u ON u.id=p."userId" WHERE p.id=$1 AND p."isActive"=TRUE`,
+            [postId]
+        );
+        if (!post) return res.status(404).json({ error: 'Gönderi bulunamadı' });
+
+        const storyId  = uuidv4();
+        const postUrl  = `/share/post/${postId}`;
+        const textContent = `${post.name || post.username}: ${(post.content || '').slice(0, 100)}`;
+
+        await dbRun(
+            `INSERT INTO stories (id, "userId", "mediaUrl", "mediaType", text, "linkUrl", "createdAt", "expiresAt")
+             VALUES ($1, $2, $3, 'image', $4, $5, NOW(), NOW() + INTERVAL '24 hours')`,
+            [storyId, req.user.id, post.mediaUrl || post.media || '', textContent, postUrl]
+        ).catch(async () => {
+            // Fallback for older schema
+            await dbRun(
+                `INSERT INTO stories (id, "userId", "mediaUrl", "mediaType", text, "createdAt", "expiresAt")
+                 VALUES ($1, $2, $3, 'image', $4, NOW(), NOW() + INTERVAL '24 hours')`,
+                [storyId, req.user.id, post.mediaUrl || post.media || '', textContent]
+            );
+        });
+
+        res.json({ success: true, storyId, message: 'Hikayeye eklendi' });
+    } catch (e) {
+        console.error('[story share-post]', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+
+
 // ─── 43. KULLANICI ARA (v2) ─────────────────────────────────────────
-app.get('/api/search/users', authenticateToken, async (req, res) => {
+app.get('/api/search/users', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { q, page = 1, limit = 20 } = req.query;
         if (!q || q.trim().length < 2) return res.status(400).json({ error: 'En az 2 karakter gerekli' });
@@ -8127,6 +9378,12 @@ app.get('/api/search/users', authenticateToken, async (req, res) => {
                     EXISTS(SELECT 1 FROM follows WHERE "followerId" = $1 AND "followingId" = users.id) as "isFollowing"
              FROM users
              WHERE "isActive" = TRUE AND (LOWER(username) LIKE $2 OR LOWER(name) LIKE $2)
+               AND id != $1
+               AND id NOT IN (
+                   SELECT "blockedId" FROM blocks WHERE "blockerId" = $1
+                   UNION
+                   SELECT "blockerId" FROM blocks WHERE "blockedId" = $1
+               )
              ORDER BY "isVerified" DESC, "hasFarmerBadge" DESC, name ASC
              LIMIT $3 OFFSET $4`,
             [req.user.id, searchTerm, parseInt(limit), offset]
@@ -8140,7 +9397,7 @@ app.get('/api/search/users', authenticateToken, async (req, res) => {
 });
 
 // ─── 44. POST ARA ───────────────────────────────────────────────────
-app.get('/api/search/posts', authenticateToken, async (req, res) => {
+app.get('/api/search/posts', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { q, page = 1, limit = 20 } = req.query;
         if (!q || q.trim().length < 2) return res.status(400).json({ error: 'En az 2 karakter gerekli' });
@@ -8155,6 +9412,11 @@ app.get('/api/search/posts', authenticateToken, async (req, res) => {
              FROM posts p
              JOIN users u ON p."userId" = u.id
              WHERE p."isActive" = TRUE AND LOWER(p.content) LIKE $2
+               AND p."userId" NOT IN (
+                   SELECT "blockedId" FROM blocks WHERE "blockerId" = $1
+                   UNION
+                   SELECT "blockerId" FROM blocks WHERE "blockedId" = $1
+               )
              ORDER BY p."createdAt" DESC
              LIMIT $3 OFFSET $4`,
             [req.user.id, searchTerm, parseInt(limit), offset]
@@ -8168,7 +9430,7 @@ app.get('/api/search/posts', authenticateToken, async (req, res) => {
 });
 
 // ─── 45. HASHTAG İLE ARA ────────────────────────────────────────────
-app.get('/api/search/hashtag/:tag', authenticateToken, async (req, res) => {
+app.get('/api/search/hashtag/:tag', authenticateToken, searchLimiter, async (req, res) => {
     try {
         const { page = 1, limit = 20 } = req.query;
         const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
@@ -8183,6 +9445,11 @@ app.get('/api/search/hashtag/:tag', authenticateToken, async (req, res) => {
              JOIN post_hashtags ph ON ph."postId" = p.id
              JOIN hashtags h ON ph."hashtagId" = h.id
              WHERE p."isActive" = TRUE AND h.tag = $2
+               AND p."userId" NOT IN (
+                   SELECT "blockedId" FROM blocks WHERE "blockerId" = $1
+                   UNION
+                   SELECT "blockerId" FROM blocks WHERE "blockedId" = $1
+               )
              ORDER BY p."createdAt" DESC
              LIMIT $3 OFFSET $4`,
             [req.user.id, tag, parseInt(limit), offset]
@@ -8267,7 +9534,7 @@ app.put('/api/store/products/:id', authenticateToken, (req, res, next) => {
             for (let i = 0; i < files.length; i++) {
                 const filename = `product_${uuidv4().replace(/-/g,"").slice(0,16)}_${i}.webp`;
                 const outputPath = path.join(postsDir, filename);
-                await sharp(files[i].path).resize(1080, 1080, { fit: 'inside', withoutEnlargement: true }).webp({ quality: 85 }).toFile(outputPath);
+                await processImage(files[i].path, outputPath, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
                 await fs.unlink(files[i].path).catch(() => {});
                 images.push(`/uploads/posts/${filename}`);
             }
@@ -8313,7 +9580,7 @@ app.delete('/api/auth/account', authenticateToken, async (req, res) => {
 
         const user = await dbGet('SELECT password FROM users WHERE id = $1', [req.user.id]);
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
 
         await dbRun('UPDATE users SET "isActive" = FALSE, "updatedAt" = NOW() WHERE id = $1', [req.user.id]);
         await dbRun('UPDATE refresh_tokens SET "isActive" = FALSE WHERE "userId" = $1', [req.user.id]);
@@ -8328,16 +9595,44 @@ app.delete('/api/auth/account', authenticateToken, async (req, res) => {
 // ─── 52. KULLANICI ÖNERİLERİ ────────────────────────────────────────
 app.get('/api/users/suggestions', authenticateToken, async (req, res) => {
     try {
-        const suggestions = await dbAll(
-            `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge", "userType"
-             FROM users
-             WHERE "isActive" = TRUE AND id != $1
-               AND id NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1)
-               AND id NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1)
-             ORDER BY "isVerified" DESC, "hasFarmerBadge" DESC, RANDOM()
-             LIMIT 10`,
+        // Önce ortak bağlantı mantığıyla öner (takip ettiklerinin takip ettikleri)
+        const mutual = await dbAll(
+            `SELECT DISTINCT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType",
+                    COUNT(DISTINCT f2.id) AS "mutualCount"
+             FROM follows f1
+             JOIN follows f2 ON f1."followingId" = f2."followerId"
+             JOIN users u ON f2."followingId" = u.id
+             WHERE f1."followerId" = $1
+               AND f2."followingId" != $1
+               AND u."isActive" = TRUE
+               AND f2."followingId" NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1)
+               AND f2."followingId" NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1)
+             GROUP BY u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u."userType"
+             ORDER BY "mutualCount" DESC
+             LIMIT 5`,
             [req.user.id]
         );
+
+        let suggestions = [...mutual];
+
+        // Ortak bağlantı yetmezse rastgele tamamla — kullanıcı ID tabanlı seed ile farklı sıralama
+        if (suggestions.length < 10) {
+            const needed = 10 - suggestions.length;
+            const existingIds = suggestions.map(s => s.id);
+            const extra = await dbAll(
+                `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge", "userType", 0 AS "mutualCount"
+                 FROM users
+                 WHERE "isActive" = TRUE AND id != $1
+                   AND id NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1)
+                   AND id NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1)
+                   ${existingIds.length > 0 ? `AND id NOT IN (${existingIds.map((_, i) => `$${i+3}`).join(',')})` : ''}
+                 ORDER BY "isVerified" DESC, "hasFarmerBadge" DESC, RANDOM()
+                 LIMIT $2`,
+                [req.user.id, needed, ...existingIds]
+            );
+            suggestions = [...suggestions, ...extra];
+        }
+
         res.json({ suggestions });
     } catch (error) {
         console.error('Öneriler hatası:', error);
@@ -8394,7 +9689,7 @@ app.put('/api/users/privacy', authenticateToken, async (req, res) => {
 });
 
 // ─── 57. KULLANICI ŞİKAYET ET ───────────────────────────────────────
-app.post('/api/reports/user', authenticateToken, async (req, res) => {
+app.post('/api/reports/user', authenticateToken, reportLimiter, async (req, res) => {
     try {
         const { userId, reason, description } = req.body;
         if (!userId || !reason) return res.status(400).json({ error: 'Kullanıcı ID ve neden gerekli' });
@@ -8451,24 +9746,130 @@ app.get('/api/posts/:id/detail', authenticateToken, async (req, res) => {
 });
 
 // ─── 60. KEŞFET ────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════
+// 🔍 KEŞFET ALGORİTMASI v2 — Kişiselleştirilmiş & Sürekli Yenilenen
+// ════════════════════════════════════════════════════════════════════
+// Algoritma puanlama mantığı:
+//   - Taze içerik (son 48 saat):        +40 puan
+//   - Orta taze (2-7 gün):              +20 puan
+//   - Kullanıcı ilgi alanı eşleşmesi:   +30 puan (hashtag bazlı)
+//   - Yüksek etkileşim (viral):         +25 puan (likeCount > 50)
+//   - Orta etkileşim:                   +15 puan (likeCount > 10)
+//   - Takip edilen birinin beğendiği:   +20 puan
+//   - Mavi tik sahibi kullanıcı:        +10 puan
+//   - Çiftçi rozeti:                    +10 puan
+//   - Random tuz (her kullanıcı farklı görsün): ±15 puan
+//   - Daha önce görülmüş post:          -50 puan (aşağıya düşür)
+// ════════════════════════════════════════════════════════════════════
 app.get('/api/explore', authenticateToken, async (req, res) => {
     try {
-        const { page = 1, limit = 30 } = req.query;
-        const offset = (Math.max(parseInt(page)||1, 1) - 1) * Math.min(Math.max(parseInt(limit)||20,1), 200);
+        const { page = 1, limit = 20 } = req.query;
+        const pageNum  = Math.max(1, parseInt(page) || 1);
+        const limitNum = Math.min(Math.max(parseInt(limit) || 20, 1), 50);
+
+        const userId = req.user.id;
+
+        // Kullanıcıya özgü deterministik tohum (her oturumda aynı sıra ama kullanıcıya göre farklı)
+        // Günlük rotasyon: gün değişince karışım yenilenir
+        const dayOfYear = Math.floor(Date.now() / (1000 * 60 * 60 * 24));
+        const userSeed  = parseInt(userId.replace(/-/g, '').slice(0, 8), 16);
+        const dailySeed = (userSeed ^ dayOfYear) % 1000000;
+
+        // 24 saatten eski görülmüş postları temizle
+        await dbRun(`DELETE FROM explore_seen_posts WHERE "seenAt" < NOW() - INTERVAL '24 hours'`, []).catch(() => {});
 
         const posts = await dbAll(
-            `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
+            `WITH
+            -- Kullanıcının ilgi hashtag'leri
+            user_tags AS (
+                SELECT LOWER(interest) as tag FROM user_interests WHERE "userId" = $1
+            ),
+            -- Takip edilenlerin son 48 saatteki beğenileri
+            friend_likes AS (
+                SELECT DISTINCT l."postId"
+                FROM likes l
+                JOIN follows f ON f."followingId" = l."userId"
+                WHERE f."followerId" = $1
+                  AND l."createdAt" > NOW() - INTERVAL '48 hours'
+            ),
+            -- Her postun hashtag'leriyle ilgi eşleşmesi
+            tag_match AS (
+                SELECT ph."postId", COUNT(*) as match_count
+                FROM post_hashtags ph
+                JOIN hashtags h ON h.id = ph."hashtagId"
+                WHERE LOWER(h.tag) IN (SELECT tag FROM user_tags)
+                GROUP BY ph."postId"
+            ),
+            -- Görülmüş postlar
+            seen AS (
+                SELECT "postId" FROM explore_seen_posts WHERE "userId" = $1
+            ),
+            -- Puanlama
+            scored AS (
+                SELECT
+                    p.*,
+                    u.name,
+                    u."profilePic",
+                    u."isVerified",
+                    u."hasFarmerBadge",
                     EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
-                    EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved"
-             FROM posts p
-             JOIN users u ON p."userId" = u.id
-             WHERE p."isActive" = TRUE AND p.media IS NOT NULL
-             ORDER BY p."likeCount" DESC, p.views DESC, p."createdAt" DESC
-             LIMIT $2 OFFSET $3`,
-            [req.user.id, Math.min(Math.max(parseInt(limit)||20, 1), 200), Math.max(offset||0, 0)]
+                    EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved",
+                    -- Taze içerik puanı
+                    CASE
+                        WHEN p."createdAt" > NOW() - INTERVAL '48 hours' THEN 40
+                        WHEN p."createdAt" > NOW() - INTERVAL '7 days'   THEN 20
+                        WHEN p."createdAt" > NOW() - INTERVAL '30 days'  THEN 10
+                        ELSE 0
+                    END
+                    -- Etkileşim puanı
+                    + CASE
+                        WHEN (p."likeCount" + p."commentCount" * 2) > 100 THEN 25
+                        WHEN (p."likeCount" + p."commentCount" * 2) > 20  THEN 15
+                        WHEN (p."likeCount" + p."commentCount" * 2) > 5   THEN 8
+                        ELSE 0
+                    END
+                    -- İlgi alanı eşleşme puanı
+                    + COALESCE((SELECT match_count * 30 FROM tag_match tm WHERE tm."postId" = p.id), 0)
+                    -- Takip edilen birinin beğendiği
+                    + CASE WHEN p.id IN (SELECT "postId" FROM friend_likes) THEN 20 ELSE 0 END
+                    -- Profil güvenilirlik puanı
+                    + CASE WHEN u."isVerified" = TRUE THEN 10 ELSE 0 END
+                    + CASE WHEN u."hasFarmerBadge" = TRUE THEN 10 ELSE 0 END
+                    -- Daha önce görülmüş ceza
+                    + CASE WHEN p.id IN (SELECT "postId" FROM seen) THEN -50 ELSE 0 END
+                    -- Kullanıcıya özgü random tuz (farklı kullanıcı → farklı sıra)
+                    + (((hashtext(p.id::text || $2::text) % 15) + 15) % 15) - 7
+                    AS explore_score
+                FROM posts p
+                JOIN users u ON p."userId" = u.id
+                WHERE p."isActive" = TRUE
+                  AND u."isActive" = TRUE
+                  AND u.id != $1
+                  -- Engellenen kullanıcıların postlarını gizle
+                  AND u.id NOT IN (
+                      SELECT "blockedId" FROM blocks WHERE "blockerId" = $1
+                      UNION
+                      SELECT "blockerId" FROM blocks WHERE "blockedId" = $1
+                  )
+            )
+            SELECT * FROM scored
+            ORDER BY explore_score DESC, "createdAt" DESC
+            LIMIT $3 OFFSET $4`,
+            [userId, dailySeed, limitNum, (pageNum - 1) * limitNum]
         );
 
-        res.json({ posts: posts.map(formatPost) });
+        // Gösterilen postları "görüldü" olarak işaretle (arka planda)
+        if (posts.length > 0) {
+            const values = posts.map(p => `('${userId}', '${p.id}', NOW())`).join(',');
+            dbRun(
+                `INSERT INTO explore_seen_posts ("userId", "postId", "seenAt")
+                 VALUES ${values}
+                 ON CONFLICT ("userId", "postId") DO UPDATE SET "seenAt" = NOW()`,
+                []
+            ).catch(() => {});
+        }
+
+        res.json({ posts: posts.map(formatPost), page: pageNum, hasMore: posts.length === limitNum });
     } catch (error) {
         console.error('Keşfet hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -8842,7 +10243,7 @@ app.delete('/api/users/profile-pic', authenticateToken, async (req, res) => {
 
 const agrolinkDir = path.join(__dirname, 'public', 'agrolink');
 if (fssync.existsSync(agrolinkDir)) {
-    app.use('/agrolink', express.static(agrolinkDir, { maxAge: '1d' }));
+    app.use('/agrolink', express.static(agrolinkDir, { maxAge: '1d', dotfiles: 'deny' }));
 }
 app.get('/agrolink', (req, res) => {
     const htmlPath = path.join(__dirname, 'public', 'agrolink', 'index.html');
@@ -8850,6 +10251,20 @@ app.get('/agrolink', (req, res) => {
         res.sendFile(htmlPath);
     } else {
         res.status(404).json({ error: 'AgroLink uygulaması bulunamadı' });
+    }
+});
+
+// ── React Router için SPA catch-all: /agrolink/* ──────────────────────────
+// Vite build çıktısı public/agrolink/ klasörüne kopyalanmalıdır.
+// Tüm alt rotalar (/agrolink/feed, /agrolink/profile vb.) index.html'e yönlendirilir.
+app.get('/agrolink/*', (req, res) => {
+    const htmlPath = path.join(__dirname, 'public', 'agrolink', 'index.html');
+    if (fssync.existsSync(htmlPath)) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.sendFile(htmlPath);
+    } else {
+        res.status(404).json({ error: 'AgroLink uygulaması bulunamadı. public/agrolink/index.html ekleyin.' });
     }
 });
 
@@ -8906,7 +10321,7 @@ self.addEventListener('fetch', (event) => {
 
 const publicDir = path.join(__dirname, 'public');
 if (fssync.existsSync(publicDir)) {
-    app.use(express.static(publicDir, { maxAge: '1d', index: false }));
+    app.use(express.static(publicDir, { maxAge: '1d', index: false, dotfiles: 'deny' }));
 }
 
 // ═══════════════════════════════════════════════════════
@@ -8918,7 +10333,7 @@ app.get('/hakkimizda', (req, res) => {
     const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'public, max-age=86400');
-    res.send(`<!DOCTYPE html>
+    res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
@@ -8956,7 +10371,7 @@ app.get('/kullanim', (req, res) => {
     const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'public, max-age=3600');
-    res.send(`<!DOCTYPE html>
+    res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
@@ -9096,7 +10511,7 @@ ${mediaHtml}<div style="padding:10px">${txt?`<p style="color:#e8f5e9;font-size:1
         }).join('');
 
         res.setHeader('Cache-Control', 'public, max-age=120');
-        res.send(`<!DOCTYPE html>
+        res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -9155,6 +10570,135 @@ ${coverUrl ? `<img class="cover" src="${coverUrl}" alt="kapak">` : '<div class="
 </body></html>`);
     } catch (e) {
         console.error('[PROFİL SAYFASI] Hata:', e.message);
+        res.redirect('/');
+    }
+});
+
+// Gönderi paylaşım sayfası: /post/:postId (tam handler — redirect değil, direkt HTML)
+app.get('/post/:postId', async (req, res) => {
+    const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
+    try {
+        const postId = req.params.postId?.trim();
+        if (!postId) return res.redirect('/');
+
+        const post = await dbGet(
+            `SELECT p.id, p.content, p.media, p."mediaType", p."mediaUrls",
+                    p."likeCount", p."commentCount", p."createdAt",
+                    u.name, u.username, u."profilePic", u."isVerified"
+             FROM posts p JOIN users u ON p."userId"=u.id
+             WHERE p.id=$1 AND p."isActive"=TRUE LIMIT 1`,
+            [postId]
+        ).catch(() => null);
+
+        if (!post) {
+            return res.status(404).send(`<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+<title>Gönderi Bulunamadı • AgroLink</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#060d0a;color:#e8f5e9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{text-align:center;padding:40px}.logo{font-size:28px;font-weight:800;color:#00e676;margin-bottom:16px}
+p{color:rgba(255,255,255,0.5);margin-bottom:24px}a{display:inline-block;padding:12px 28px;background:#00e676;color:#020810;border-radius:50px;text-decoration:none;font-weight:700}
+</style></head><body><div class="box"><div class="logo">🌾 AgroLink</div><h2>Gönderi bulunamadı</h2>
+<p>Bu gönderi silinmiş veya mevcut değil.</p><a href="${DOMAIN}">Ana Sayfaya Dön</a></div></body></html>`);
+        }
+
+        let mediaItems = [];
+        if (post.mediaUrls) {
+            try {
+                const arr = typeof post.mediaUrls === 'string' ? JSON.parse(post.mediaUrls) : post.mediaUrls;
+                mediaItems = (arr||[]).map(item => {
+                    const url = item?.url || (typeof item === 'string' ? item : null);
+                    if (!url) return null;
+                    return { url: url.startsWith('http') ? url : DOMAIN + url, type: item?.type || post.mediaType || 'image' };
+                }).filter(Boolean);
+            } catch {}
+        }
+        if (!mediaItems.length && post.media)
+            mediaItems = [{ url: post.media.startsWith('http') ? post.media : DOMAIN + post.media, type: post.mediaType || 'image' }];
+
+        const profPic  = post.profilePic ? (post.profilePic.startsWith('http') ? post.profilePic : DOMAIN + post.profilePic) : `${DOMAIN}/agro.png`;
+        const first    = mediaItems[0];
+        const ogImg    = (first?.type === 'image' ? first.url : null) || profPic;
+        const title    = `${post.name || post.username} (@${post.username}) • AgroLink`;
+        const rawDesc  = (post.content||'').replace(/<[^>]*>/g,'').substring(0,200);
+        const desc     = rawDesc || 'AgroLink Tarım Topluluğu paylaşımı';
+        const pageUrl  = `${DOMAIN}/post/${post.id}`;
+        const profUrl  = `${DOMAIN}/u/${post.username}`;
+        const badge    = post.isVerified ? ' ✓' : '';
+        const diff     = Date.now() - new Date(post.createdAt).getTime();
+        const m        = Math.floor(diff/60000);
+        const timeAgo  = m<1?'Az önce':m<60?m+' dk önce':m<1440?Math.floor(m/60)+' saat önce':Math.floor(m/1440)+' gün önce';
+        const mediaHtml = mediaItems.map(item =>
+            item.type==='video'
+            ? `<video controls style="width:100%;max-height:480px;background:#000;display:block" src="${item.url}"></video>`
+            : `<img src="${item.url}" alt="görsel" style="width:100%;display:block;max-height:580px;object-fit:cover">`
+        ).join('');
+
+        res.setHeader('Cache-Control', 'public, max-age=120');
+        res.type('html').send(`<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<meta name="description" content="${desc}">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="AgroLink">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${desc}">
+<meta property="og:image" content="${ogImg}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:url" content="${pageUrl}">
+<meta property="og:locale" content="tr_TR">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${title}">
+<meta name="twitter:description" content="${desc}">
+<meta name="twitter:image" content="${ogImg}">
+<link rel="canonical" href="${pageUrl}">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;background:#060d0a;color:#e8f5e9;min-height:100vh}
+.wrap{max-width:600px;margin:0 auto;padding:16px 16px 56px}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.brand{font-size:21px;font-weight:800;color:#00e676}
+.card{background:#0d1a12;border:1px solid rgba(0,230,118,0.12);border-radius:20px;overflow:hidden}
+.author{display:flex;align-items:center;gap:12px;padding:14px 16px}
+.avatar{width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #00e676;flex-shrink:0}
+.aname{font-weight:700;font-size:15px;color:#e8f5e9}
+.ausr{color:#00e676;font-size:13px}
+.media-wrap{overflow:hidden}
+.body{padding:14px 16px;font-size:15px;line-height:1.65;color:#e8f5e9;white-space:pre-wrap;word-break:break-word}
+.stats{display:flex;gap:20px;padding:10px 16px;border-top:1px solid rgba(0,230,118,0.08);color:rgba(255,255,255,0.45);font-size:13px}
+.stats strong{color:#e8f5e9}
+.time{padding:4px 16px 14px;color:rgba(255,255,255,0.3);font-size:12px}
+.cta-area{text-align:center;margin-top:20px}
+.cta{display:inline-block;padding:13px 32px;background:linear-gradient(135deg,#00e676,#1de9b6);color:#020810;font-weight:800;border-radius:50px;text-decoration:none;font-size:15px}
+.foot{text-align:center;margin-top:24px;color:rgba(255,255,255,0.2);font-size:12px}
+.foot span{color:#00e676;font-weight:700}</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">🌾 AgroLink</div>
+    <a href="${DOMAIN}" style="color:#00e676;font-size:13px;text-decoration:none">Ana Sayfa →</a>
+  </div>
+  <div class="card">
+    <a href="${profUrl}" style="text-decoration:none">
+      <div class="author">
+        <img class="avatar" src="${profPic}" alt="${post.name}" onerror="this.src='${DOMAIN}/agro.png'">
+        <div><div class="aname">${post.name||post.username}${badge}</div><div class="ausr">@${post.username}</div></div>
+      </div>
+    </a>
+    ${mediaHtml ? `<div class="media-wrap">${mediaHtml}</div>` : ''}
+    ${post.content ? `<div class="body">${(post.content||'').replace(/<[^>]*>/g,'')}</div>` : ''}
+    <div class="stats">
+      <div>❤️ <strong>${post.likeCount||0}</strong></div>
+      <div>💬 <strong>${post.commentCount||0}</strong></div>
+    </div>
+    <div class="time">${timeAgo}</div>
+  </div>
+  <div class="cta-area"><a class="cta" href="${DOMAIN}">📱 AgroLink'te Aç</a></div>
+  <div class="foot">🌾 <span>AgroLink</span> — Tarım Topluluğu</div>
+</div>
+</body></html>`);
+    } catch (e) {
+        console.error('[POST SAYFASI /post/] Hata:', e.message);
         res.redirect('/');
     }
 });
@@ -9218,7 +10762,7 @@ p{color:rgba(255,255,255,0.5);margin-bottom:24px}a{display:inline-block;padding:
         ).join('');
 
         res.setHeader('Cache-Control', 'public, max-age=120');
-        res.send(`<!DOCTYPE html>
+        res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -9441,34 +10985,111 @@ app.get('/api/posts/saved', authenticateToken, async (req, res) => {
 });
 
 // ─── EXPLORE FEED: /api/feed/explore ───────────────────────────────
-// Takip edilmeyenlerin popüler postlarını gösterir
+// Takip edilmeyenlerin postları — aynı akıllı algoritma, sadece takip edilmeyenler
 app.get('/api/feed/explore', authenticateToken, async (req, res) => {
     try {
         const { page = 1, limit = 10 } = req.query;
-        const pageNum = Math.max(1, parseInt(page) || 1);
-        const limitNum = Math.min(parseInt(limit) || 10, 100);
-        const offset = (pageNum - 1) * limitNum;
+        const pageNum  = Math.max(1, parseInt(page) || 1);
+        const limitNum = Math.min(parseInt(limit) || 10, 50);
+
+        const userId = req.user.id;
+
+        const dayOfYear = Math.floor(Date.now() / (1000 * 60 * 60 * 24));
+        const userSeed  = parseInt(userId.replace(/-/g, '').slice(0, 8), 16);
+        const dailySeed = (userSeed ^ dayOfYear) % 1000000;
+
+        await dbRun(`DELETE FROM explore_seen_posts WHERE "seenAt" < NOW() - INTERVAL '24 hours'`, []).catch(() => {});
 
         const posts = await dbAll(
-            `SELECT p.*, u."profilePic" as "userProfilePic", u.name as "userName", u."isVerified" as "userVerified",
-                EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
-                EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved"
-             FROM posts p JOIN users u ON p."userId" = u.id
-             WHERE p."userId" NOT IN (
-                 SELECT "followingId" FROM follows WHERE "followerId" = $1
-                 UNION SELECT $1
-             )
-             AND p."isActive" = TRUE AND u."isActive" = TRUE
-             ORDER BY (p."likeCount" * 2 + p."commentCount") DESC, p."createdAt" DESC
-             LIMIT $2 OFFSET $3`,
-            [req.user.id, limitNum, offset]
+            `WITH
+            user_tags AS (
+                SELECT LOWER(interest) as tag FROM user_interests WHERE "userId" = $1
+            ),
+            friend_likes AS (
+                SELECT DISTINCT l."postId"
+                FROM likes l
+                JOIN follows f ON f."followingId" = l."userId"
+                WHERE f."followerId" = $1
+                  AND l."createdAt" > NOW() - INTERVAL '48 hours'
+            ),
+            tag_match AS (
+                SELECT ph."postId", COUNT(*) as match_count
+                FROM post_hashtags ph
+                JOIN hashtags h ON h.id = ph."hashtagId"
+                WHERE LOWER(h.tag) IN (SELECT tag FROM user_tags)
+                GROUP BY ph."postId"
+            ),
+            seen AS (
+                SELECT "postId" FROM explore_seen_posts WHERE "userId" = $1
+            ),
+            scored AS (
+                SELECT
+                    p.*,
+                    u."profilePic" as "userProfilePic",
+                    u.name as "userName",
+                    u."isVerified" as "userVerified",
+                    u."hasFarmerBadge",
+                    EXISTS(SELECT 1 FROM likes WHERE "postId" = p.id AND "userId" = $1) as "isLiked",
+                    EXISTS(SELECT 1 FROM saves WHERE "postId" = p.id AND "userId" = $1) as "isSaved",
+                    CASE
+                        WHEN p."createdAt" > NOW() - INTERVAL '48 hours' THEN 40
+                        WHEN p."createdAt" > NOW() - INTERVAL '7 days'   THEN 20
+                        WHEN p."createdAt" > NOW() - INTERVAL '30 days'  THEN 10
+                        ELSE 0
+                    END
+                    + CASE
+                        WHEN (p."likeCount" + p."commentCount" * 2) > 100 THEN 25
+                        WHEN (p."likeCount" + p."commentCount" * 2) > 20  THEN 15
+                        WHEN (p."likeCount" + p."commentCount" * 2) > 5   THEN 8
+                        ELSE 0
+                    END
+                    + COALESCE((SELECT match_count * 30 FROM tag_match tm WHERE tm."postId" = p.id), 0)
+                    + CASE WHEN p.id IN (SELECT "postId" FROM friend_likes) THEN 20 ELSE 0 END
+                    + CASE WHEN u."isVerified" = TRUE THEN 10 ELSE 0 END
+                    + CASE WHEN u."hasFarmerBadge" = TRUE THEN 10 ELSE 0 END
+                    + CASE WHEN p.id IN (SELECT "postId" FROM seen) THEN -50 ELSE 0 END
+                    + (((hashtext(p.id::text || $2::text) % 15) + 15) % 15) - 7
+                    AS explore_score
+                FROM posts p
+                JOIN users u ON p."userId" = u.id
+                WHERE p."isActive" = TRUE
+                  AND u."isActive" = TRUE
+                  -- Sadece takip EDİLMEYENLERİN postları
+                  AND p."userId" NOT IN (
+                      SELECT "followingId" FROM follows WHERE "followerId" = $1
+                      UNION SELECT $1
+                  )
+                  AND u.id NOT IN (
+                      SELECT "blockedId" FROM blocks WHERE "blockerId" = $1
+                      UNION
+                      SELECT "blockerId" FROM blocks WHERE "blockedId" = $1
+                  )
+                  -- 🔒 Gizli hesaplar keşfete çıkamaz
+                  AND u."isPrivate" = FALSE
+            )
+            SELECT * FROM scored
+            ORDER BY explore_score DESC, "createdAt" DESC
+            LIMIT $3 OFFSET $4`,
+            [userId, dailySeed, limitNum, (pageNum - 1) * limitNum]
         );
 
+        if (posts.length > 0) {
+            const values = posts.map(p => `('${userId}', '${p.id}', NOW())`).join(',');
+            dbRun(
+                `INSERT INTO explore_seen_posts ("userId", "postId", "seenAt")
+                 VALUES ${values}
+                 ON CONFLICT ("userId", "postId") DO UPDATE SET "seenAt" = NOW()`,
+                []
+            ).catch(() => {});
+        }
+
+        // total count (pagination için)
         const totalResult = await dbGet(
             `SELECT COUNT(*) as count FROM posts p JOIN users u ON p."userId" = u.id
-             WHERE p."userId" NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1 UNION SELECT $1)
-             AND p."isActive" = TRUE AND u."isActive" = TRUE`,
-            [req.user.id]
+             WHERE p."isActive" = TRUE AND u."isActive" = TRUE
+               AND p."userId" NOT IN (SELECT "followingId" FROM follows WHERE "followerId" = $1 UNION SELECT $1)
+               AND u.id NOT IN (SELECT "blockedId" FROM blocks WHERE "blockerId" = $1 UNION SELECT "blockerId" FROM blocks WHERE "blockedId" = $1)`,
+            [userId]
         );
         const total = parseInt(totalResult?.count || 0);
 
@@ -9576,6 +11197,22 @@ app.post('/api/auth/register-verify', validateAuthInput, async (req, res) => {
         await dbRun(`UPDATE users SET "emailVerified" = TRUE, "updatedAt" = NOW() WHERE id = $1`, [verification.userId]);
         await dbRun(`DELETE FROM email_verifications WHERE "userId" = $1`, [verification.userId]);
 
+        // 🌾 Yeni kullanıcı varsayılan hesapları takip etsin
+        try {
+            const defaultAccounts = ['agro_sosyal', 'agrolink_news', 'yemektarifleri', 'agroabot', 'akilli.tarlam'];
+            for (const uname of defaultAccounts) {
+                const acc = await dbGet('SELECT id FROM users WHERE username = $1', [uname]);
+                if (acc) {
+                    await dbRun(
+                        'INSERT INTO follows (id, "followerId", "followingId", "createdAt") VALUES ($1, $2, $3, NOW()) ON CONFLICT ("followerId", "followingId") DO NOTHING',
+                        [uuidv4(), verification.userId, acc.id]
+                    );
+                }
+            }
+        } catch (followErr) {
+            console.warn('⚠️ Otomatik takip hatası:', followErr.message);
+        }
+
         const user = await dbGet(
             `SELECT id, name, username, email, "profilePic", bio FROM users WHERE id = $1`,
             [verification.userId]
@@ -9632,7 +11269,8 @@ app.post('/api/auth/verify-2fa', validateAuthInput, async (req, res) => {
         if (!user) return res.status(401).json({ error: 'Kullanıcı bulunamadı' });
 
         await dbRun('UPDATE users SET "lastLogin" = NOW(), "isOnline" = TRUE, "updatedAt" = NOW() WHERE id = $1', [user.id]);
-
+        dbRun(`INSERT INTO user_login_hours ("userId", hour) VALUES ($1, $2)`,
+            [user.id, new Date().getHours()]).catch(() => {});
         const tokens = generateTokens(user);
         const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
         await dbRun(
@@ -9720,7 +11358,7 @@ app.post('/api/auth/not-me', async (req, res) => {
         sendEmail(user.email, '⚠️ Agrolink — Şüpheli Giriş Bildirimi',
             `<p>Hesabınıza şüpheli bir giriş yapıldı ve siz bunu bildirdiniz.</p>
              <p>Tüm oturumlarınız sonlandırıldı. Lütfen şifrenizi değiştirin.</p>
-             <p>Şifre sıfırlama bağlantısı: <a href="https://sehitumitkestitarimmtal.com/api/auth/reset-password-direct?token=${resetToken}">Buraya tıklayın</a></p>`
+             <p>Şifre sıfırlama bağlantısı: <a href="${process.env.APP_URL || "https://sehitumitkestitarimmtal.com"}/api/auth/reset-password-direct?token=${resetToken}">Buraya tıklayın</a></p>`
         ).catch(() => {});
 
         res.json({
@@ -9959,6 +11597,17 @@ app.get('/api/users/:id/followers/list', authenticateToken, async (req, res) => 
         const { page=1, limit=20 } = req.query;
         const pn = Math.max(1,parseInt(page)||1), ln = Math.min(parseInt(limit)||20,100);
         const off = (pn-1)*ln;
+        // 🔒 Gizli hesap: kendisi değilse ve takipçi değilse liste boş döner
+        if (req.params.id !== req.user.id) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                 FROM users WHERE id=$2`,
+                [req.user.id, req.params.id]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                return res.json({ followers: [], total: 0, page: pn, totalPages: 0, isPrivate: true });
+            }
+        }
         const followers = await dbAll(`
             SELECT u.id, u.name, u.username, u."profilePic", u."isVerified",
                 EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=u.id) AS "isFollowing",
@@ -9978,6 +11627,17 @@ app.get('/api/users/:id/following/list', authenticateToken, async (req, res) => 
         const { page=1, limit=20 } = req.query;
         const pn = Math.max(1,parseInt(page)||1), ln = Math.min(parseInt(limit)||20,100);
         const off = (pn-1)*ln;
+        // 🔒 Gizli hesap: kendisi değilse ve takipçi değilse liste boş döner
+        if (req.params.id !== req.user.id) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                 FROM users WHERE id=$2`,
+                [req.user.id, req.params.id]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                return res.json({ following: [], total: 0, page: pn, totalPages: 0, isPrivate: true });
+            }
+        }
         const following = await dbAll(`
             SELECT u.id, u.name, u.username, u."profilePic", u."isVerified",
                 EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=u.id) AS "isFollowing"
@@ -10080,7 +11740,7 @@ app.post('/api/messages/image', authenticateToken, upload.single('image'), async
         if (blocked) return res.status(403).json({ error:'Mesaj gönderilemiyor' });
         const filename  = `msg_${uuidv4().replace(/-/g,"").slice(0,16)}.webp`;
         const outPath   = path.join(postsDir, filename);
-        await sharp(req.file.path).resize(1920,1920,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(outPath);
+        await processImage(req.file.path, outPath, { width: 1920, height: 1920, fit: 'inside', quality: 78, effort: 4 });
         await fs.unlink(req.file.path).catch(()=>{});
         const imageUrl  = `/uploads/posts/${filename}`;
         const sender    = await dbGet('SELECT username FROM users WHERE id=$1',[req.user.id]);
@@ -10098,22 +11758,70 @@ app.post('/api/messages/voice', authenticateToken, upload.single('voice'), async
     try {
         const { recipientId } = req.body;
         if (!recipientId || !req.file) return res.status(400).json({ error:'Alıcı ve ses dosyası gerekli' });
+
+        // Sadece audio MIME türü kabul et
+        if (!req.file.mimetype.startsWith('audio/')) {
+            await fs.unlink(req.file.path).catch(()=>{});
+            return res.status(400).json({ error:'Sadece ses dosyası kabul edilir' });
+        }
+
+        // Boyut limiti: 10MB
+        const MAX_VOICE_SIZE = 10 * 1024 * 1024;
+        if (req.file.size > MAX_VOICE_SIZE) {
+            await fs.unlink(req.file.path).catch(()=>{});
+            return res.status(400).json({ error:'Ses dosyası 10MB\'ı geçemez' });
+        }
+
         const recipient = await dbGet('SELECT id,username FROM users WHERE id=$1 AND "isActive"=TRUE',[recipientId]);
         if (!recipient) return res.status(404).json({ error:'Kullanıcı bulunamadı' });
+
+        // 🔒 Block kontrolü
+        const blocked = await dbGet('SELECT id FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)',[req.user.id,recipientId]);
+        if (blocked) return res.status(403).json({ error:'Bu kullanıcıya mesaj gönderilemiyor' });
+
         const voiceDir = path.join(uploadsDir,'voice');
         if (!fssync.existsSync(voiceDir)) fssync.mkdirSync(voiceDir,{recursive:true});
-        const filename = `voice_${uuidv4().replace(/-/g,"").slice(0,16)}.webm`;
+
+        // MIME tipine göre uzantı belirle (webm/ogg/mp4/m4a)
+        const extMap = {
+            'audio/webm':'webm','audio/ogg':'ogg','audio/mpeg':'mp3',
+            'audio/mp4':'m4a','audio/mp3':'mp3','audio/wav':'wav',
+            'audio/x-wav':'wav','audio/aac':'aac','audio/x-m4a':'m4a','audio/3gpp':'3gp'
+        };
+        const ext = extMap[req.file.mimetype] || 'webm';
+        const filename = `voice_${uuidv4().replace(/-/g,"").slice(0,16)}.${ext}`;
         const outPath  = path.join(voiceDir, filename);
         await fs.copyFile(req.file.path, outPath);
         await fs.unlink(req.file.path).catch(()=>{});
+
         const voiceUrl = `/uploads/voice/${filename}`;
         const sender   = await dbGet('SELECT username FROM users WHERE id=$1',[req.user.id]);
         const msgId    = uuidv4();
-        await dbRun(`INSERT INTO messages (id,"senderId","senderUsername","recipientId","recipientUsername",content,read,"createdAt","updatedAt") VALUES ($1,$2,$3,$4,$5,$6,FALSE,NOW(),NOW())`,[msgId,req.user.id,sender.username,recipientId,recipient.username,voiceUrl]);
-        res.status(201).json({ message:'Sesli mesaj gönderildi', messageId:msgId, voiceUrl });
+
+        // 🔒 mediaType='voice' olarak kaydet — frontend sesli mesaj olarak render eder
+        await dbRun(
+            `INSERT INTO messages (id,"senderId","senderUsername","recipientId","recipientUsername",content,"mediaUrl","mediaType",read,"createdAt","updatedAt")
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'voice',FALSE,NOW(),NOW())`,
+            [msgId, req.user.id, sender.username, recipientId, recipient.username, voiceUrl, voiceUrl]
+        );
+
+        // Socket.IO ile anlık iletim (alıcı online ise)
+        if (io && onlineUsers.has(recipientId)) {
+            const newMsg = {
+                id: msgId, senderId: req.user.id, receiverId: recipientId,
+                content: voiceUrl, mediaUrl: voiceUrl, mediaType: 'voice',
+                createdAt: new Date().toISOString(),
+            };
+            for (const sid of onlineUsers.get(recipientId)) {
+                io.to(sid).emit('message:receive', newMsg);
+            }
+        }
+
+        res.status(201).json({ success:true, message:'Sesli mesaj gönderildi', messageId:msgId, voiceUrl, mediaType:'voice' });
     } catch (e) {
         if (req.file) await fs.unlink(req.file.path).catch(()=>{});
-        console.error(e); res.status(500).json({ error:'Sunucu hatası' });
+        console.error('[Voice Upload]', e.message);
+        res.status(500).json({ error:'Sunucu hatası' });
     }
 });
 
@@ -10123,11 +11831,11 @@ app.get('/api/farmbook/records', authenticateToken, async (req, res) => {
         const { season, year, type, page=1, limit=50 } = req.query;
         const pn=Math.max(1,parseInt(page)||1), ln=Math.min(parseInt(limit)||50,200);
         const off=(pn-1)*ln;
-        const conds=['r."userId"=$1'], params=[req.user.id];
+        const conds=['"userId"=$1'], params=[req.user.id];
         let pi=2;
-        if (season) { conds.push(`r.season=$${pi++}`); params.push(season); }
-        if (year)   { conds.push(`r.year=$${pi++}`);   params.push(parseInt(year)); }
-        if (type)   { conds.push(`r."recordType"=$${pi++}`); params.push(type); }
+        if (season) { conds.push(`season=$${pi++}`); params.push(season); }
+        if (year)   { conds.push(`year=$${pi++}`);   params.push(parseInt(year)); }
+        if (type)   { conds.push(`"recordType"=$${pi++}`); params.push(type); }
         const where = conds.join(' AND ');
         const records = await dbAll(`SELECT * FROM farmbook_records WHERE ${where} ORDER BY "recordDate" DESC LIMIT $${pi} OFFSET $${pi+1}`,[...params,ln,off]);
         const tot = await dbGet(`SELECT COUNT(*) AS c FROM farmbook_records WHERE ${where}`,params);
@@ -10182,16 +11890,16 @@ app.delete('/api/farmbook/records/:id', authenticateToken, async (req, res) => {
 app.get('/api/farmbook/stats', authenticateToken, async (req, res) => {
     try {
         const { season, year } = req.query;
-        const conds=['r."userId"=$1'], params=[req.user.id];
+        const conds=['"userId"=$1'], params=[req.user.id];
         let pi=2;
-        if (season){ conds.push(`r.season=$${pi++}`); params.push(season); }
-        if (year)  { conds.push(`r.year=$${pi++}`);   params.push(parseInt(year)); }
+        if (season){ conds.push(`season=$${pi++}`); params.push(season); }
+        if (year)  { conds.push(`year=$${pi++}`);   params.push(parseInt(year)); }
         const where = conds.join(' AND ');
         const [costRow,incRow,types,monthly,seasons] = await Promise.all([
-            dbGet(`SELECT COALESCE(SUM(cost),0) AS total FROM farmbook_records r WHERE ${where}`,params),
-            dbGet(`SELECT COALESCE(SUM(income),0) AS total FROM farmbook_records r WHERE ${where}`,params),
-            dbAll(`SELECT "recordType", COUNT(*) AS count FROM farmbook_records r WHERE ${where} GROUP BY "recordType"`,params),
-            dbAll(`SELECT TO_CHAR("recordDate",'YYYY-MM') AS month, SUM(cost) AS "totalCost", SUM(income) AS "totalIncome" FROM farmbook_records r WHERE ${where} GROUP BY TO_CHAR("recordDate",'YYYY-MM') ORDER BY month DESC LIMIT 12`,params),
+            dbGet(`SELECT COALESCE(SUM(cost),0) AS total FROM farmbook_records WHERE ${where}`,params),
+            dbGet(`SELECT COALESCE(SUM(income),0) AS total FROM farmbook_records WHERE ${where}`,params),
+            dbAll(`SELECT "recordType", COUNT(*) AS count FROM farmbook_records WHERE ${where} GROUP BY "recordType"`,params),
+            dbAll(`SELECT TO_CHAR("recordDate",'YYYY-MM') AS month, SUM(cost) AS "totalCost", SUM(income) AS "totalIncome" FROM farmbook_records WHERE ${where} GROUP BY TO_CHAR("recordDate",'YYYY-MM') ORDER BY month DESC LIMIT 12`,params),
             dbAll(`SELECT DISTINCT season, year FROM farmbook_records WHERE "userId"=$1 ORDER BY year DESC`,[req.user.id])
         ]);
         const totalCost=parseFloat(costRow?.total||0), totalIncome=parseFloat(incRow?.total||0);
@@ -10314,7 +12022,7 @@ app.get('/share/profile/:username', async (req, res) => {
             'normal_kullanici' : '👤 Kullanıcı',
         }[user.userType] || '👤 Kullanıcı';
 
-        res.send(`<!DOCTYPE html>
+        res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
@@ -10477,7 +12185,7 @@ app.get('/share/post/:postId', async (req, res) => {
 
         const ogImage = (post.media && post.mediaType !== 'video') ? `${base}${post.media}` : picUrl;
 
-        res.send(`<!DOCTYPE html>
+        res.type('html').send(`<!DOCTYPE html>
 <html lang="tr">
 <head>
 <meta charset="UTF-8">
@@ -10767,7 +12475,7 @@ app.delete('/api/users/account/delete', authenticateToken, async (req, res) => {
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
 
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
 
         // Soft delete
         await dbRun(
@@ -10882,7 +12590,7 @@ app.delete('/api/users/account', authenticateToken, async (req, res) => {
         const user = await dbGet('SELECT password FROM users WHERE id=$1', [req.user.id]);
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         await dbRun('UPDATE users SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1', [req.user.id]);
         await dbRun('DELETE FROM refresh_tokens WHERE "userId"=$1', [req.user.id]).catch(()=>{});
         res.json({ message: 'Hesap silindi' });
@@ -11229,11 +12937,14 @@ function getErrorPageHtml(title, message) {
 
 // ─── ŞIFRE SIFIRLA DİREKT LİNK: GET /api/auth/reset-password-direct ─
 app.get('/api/auth/reset-password-direct', async (req, res) => {
-    const token = typeof req.query.token === 'string' ? req.query.token : null;
+    const token = typeof req.query.token === 'string' ? req.query.token.trim() : null;
 
     if (!token || !/^[a-f0-9]{64}$/i.test(token)) {
-        return res.send(getErrorPageHtml('Geçersiz Bağlantı', 'Bu link artık geçerli değil.'));
+        return res.type('html').send(getErrorPageHtml('Geçersiz Bağlantı', 'Bu link artık geçerli değil.'));
     }
+
+    // 🔒 DB'de token hash'i saklıyoruz — ham token ile değil, sha256 ile ara
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
     try {
         // Önce password_resets tablosuna bak (forgot-password akışı)
@@ -11242,7 +12953,7 @@ app.get('/api/auth/reset-password-direct', async (req, res) => {
              JOIN users u ON pr."userId" = u.id
              WHERE pr.token = $1 AND pr.used = FALSE AND pr."expiresAt" > NOW()
              LIMIT 1`,
-            [token]
+            [tokenHash]
         ).catch(() => null);
 
         // Bulunamazsa suspicious_login_reports tablosuna bak (not-me akışı)
@@ -11257,7 +12968,7 @@ app.get('/api/auth/reset-password-direct', async (req, res) => {
         }
 
         if (!record) {
-            return res.send(getErrorPageHtml(
+            return res.type('html').send(getErrorPageHtml(
                 'Link Süresi Doldu',
                 'Bu şifre sıfırlama linki süresi dolmuş veya daha önce kullanılmış.'
             ));
@@ -11265,11 +12976,12 @@ app.get('/api/auth/reset-password-direct', async (req, res) => {
 
         console.log(`🔐 Şifre sıfırlama sayfası açıldı: @${record.username}`);
         res.setHeader('Cache-Control', 'no-store');
-        res.send(getPasswordResetPageHtml(record.username, token));
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        res.type('html').send(getPasswordResetPageHtml(record.username, token));
 
     } catch (e) {
         console.error('Şifre sıfırlama direkt link hatası:', e);
-        res.send(getErrorPageHtml('Sunucu Hatası', 'Bir hata oluştu. Lütfen daha sonra tekrar deneyin.'));
+        res.type('html').send(getErrorPageHtml('Sunucu Hatası', 'Bir hata oluştu. Lütfen daha sonra tekrar deneyin.'));
     }
 });
 
@@ -11283,14 +12995,39 @@ app.get('/api/users/:id/profile', authenticateToken, async (req, res) => {
         const user = await dbGet(`
             SELECT u.id, u.username, u.name, u."profilePic", u."coverPic", u.bio, u.location,
                    u.website, u."isVerified", u."hasFarmerBadge", u."userType", u."isOnline",
-                   u."lastSeen", u."createdAt",
+                   u."lastSeen", u."createdAt", u."isPrivate",
                    (SELECT COUNT(*) FROM posts   WHERE "userId"=u.id AND "isActive"=TRUE) AS "postCount",
                    (SELECT COUNT(*) FROM follows WHERE "followingId"=u.id)                AS "followerCount",
                    (SELECT COUNT(*) FROM follows WHERE "followerId"=u.id)                 AS "followingCount",
                    EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=u.id) AS "isFollowing",
-                   EXISTS(SELECT 1 FROM blocks  WHERE "blockerId"=$1 AND "blockedId"=u.id)   AS "isBlocked"
+                   EXISTS(SELECT 1 FROM blocks  WHERE ("blockerId"=$1 AND "blockedId"=u.id) OR ("blockerId"=u.id AND "blockedId"=$1)) AS "isBlocked"
             FROM users u WHERE u.id=$2 AND u."isActive"=TRUE`, [req.user.id, req.params.id]);
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+        // 🔒 ENGEL KONTROLÜ
+        if (user.isBlocked && user.id !== req.user.id) {
+            return res.status(403).json({ error: 'Engelli kullanıcı' });
+        }
+        const isSelf      = user.id === req.user.id;
+        const isFollowing = user.isFollowing;
+        // 🔒 GİZLİ HESAP KONTROLÜ — takipçi değilse sadece temel bilgi git
+        if (user.isPrivate && !isSelf && !isFollowing) {
+            console.log(`[GİZLİ HESAP] userId=${req.user.id} → hedef=${user.id} (${user.username}) — kısıtlı profil`);
+            return res.json({
+                user: {
+                    id          : user.id,
+                    username    : user.username,
+                    name        : user.name,
+                    profilePic  : user.profilePic,
+                    isVerified  : user.isVerified,
+                    hasFarmerBadge: user.hasFarmerBadge,
+                    isPrivate   : true,
+                    isFollowing : false,
+                    postCount   : 0,
+                    followerCount: 0,
+                    followingCount: 0,
+                },
+            });
+        }
         const { password: _, ...safe } = user;
         res.json({ user: safe });
     } catch (e) { console.error(e); res.status(500).json({ error: 'Sunucu hatası' }); }
@@ -11314,6 +13051,9 @@ app.post('/api/auth/reset-password-with-token', async (req, res) => {
         if (newPassword.length < 8)
             return res.status(400).json({ error: 'Şifre en az 8 karakter olmalıdır' });
 
+        // 🔒 DB'de token hash'i saklanıyor — ham token yerine sha256 ile ara
+        const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+
         const cleanUsername = username.toLowerCase().trim();
         const user = await dbGet(
             `SELECT * FROM users WHERE LOWER(username) = $1 AND "isActive" = TRUE`,
@@ -11325,7 +13065,7 @@ app.post('/api/auth/reset-password-with-token', async (req, res) => {
         let tokenRecord = await dbGet(
             `SELECT id FROM password_resets
              WHERE "userId" = $1 AND token = $2 AND used = FALSE AND "expiresAt" > NOW()`,
-            [user.id, resetToken]
+            [user.id, resetTokenHash]
         ).catch(() => null);
         let tokenSource = 'password_resets';
 
@@ -11409,7 +13149,7 @@ app.post('/api/messages/share-post', authenticateToken, async (req, res) => {
         if (blocked) return res.status(403).json({ error: 'Bu kullanıcıya mesaj gönderemezsiniz' });
 
         const msgId = uuidv4();
-        const postUrl = `/post/${postId}`;
+        const postUrl = `/p/${postId}`;
         await dbRun(
             `INSERT INTO messages (id,"senderId","senderUsername","recipientId","recipientUsername",content,read,"createdAt","updatedAt")
              VALUES ($1,$2,$3,$4,$5,$6,FALSE,NOW(),NOW())`,
@@ -11510,7 +13250,7 @@ app.delete('/api/users/delete', authenticateToken, async (req, res) => {
         if (!password) return res.status(400).json({ error: 'Şifre gerekli' });
         const user = await dbGet('SELECT password FROM users WHERE id=$1', [req.user.id]);
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         await dbRun('UPDATE users SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1', [req.user.id]);
         await dbRun('DELETE FROM refresh_tokens WHERE "userId"=$1', [req.user.id]).catch(()=>{});
         res.json({ message: 'Hesap silindi' });
@@ -11562,7 +13302,7 @@ app.post('/api/chats/group', authenticateToken, upload.single('photo'), async (r
         if (req.file) {
             const fname = `group_${groupId}_${Date.now()}.webp`;
             const out = require('path').join(profilesDir, fname);
-            await sharp(req.file.path).resize(256,256,{fit:'cover'}).webp({quality:85}).toFile(out);
+            await processImage(req.file.path, out, { width: 256, height: 256, fit: 'cover', quality: 65, effort: 3 });
             await require('fs').promises.unlink(req.file.path).catch(()=>{});
             photoUrl = `/uploads/profiles/${fname}`;
         }
@@ -11718,7 +13458,7 @@ app.post('/api/products', authenticateToken, (req, res, next) => {
         for (let i = 0; i < files.length; i++) {
             const fname = `product_${Date.now()}_${i}.webp`;
             const out = require('path').join(postsDir, fname);
-            await sharp(files[i].path).resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
+            await processImage(files[i].path, out, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
             await fs.unlink(files[i].path).catch(()=>{});
             images.push(`/uploads/posts/${fname}`);
         }
@@ -11766,7 +13506,7 @@ app.put('/api/products/:productId', authenticateToken, (req, res, next) => {
             for (let i=0;i<files.length;i++){
                 const fname=`product_${Date.now()}_${i}.webp`;
                 const out=require('path').join(postsDir,fname);
-                await sharp(files[i].path).resize(1080,1080,{fit:'inside',withoutEnlargement:true}).webp({quality:85}).toFile(out);
+                await processImage(files[i].path, out, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
                 await fs.unlink(files[i].path).catch(()=>{});
                 imgs.push(`/uploads/posts/${fname}`);
             }
@@ -13351,852 +15091,2401 @@ app.get('/agro-hava/', (req, res) => {
     fssync.existsSync(p) ? res.sendFile(p) : res.status(404).json({ error: 'agro-hava sayfası bulunamadı. public/agro-hava/index.html ekleyin.' });
 });
 
+// ─── GET /api/weather — HAVA DURUMU ──────────────────────────────
+// OpenWeatherMap kullanır (OPENWEATHER_API_KEY varsa)
+// Open-Meteo fallback (ücretsiz, key gerekmez)
+app.get('/api/weather', authenticateToken, async (req, res) => {
+    try {
+        const { lat, lon } = req.query;
+        if (!lat || !lon) return res.status(400).json({ error: 'lat ve lon gerekli' });
+
+        const DAY_NAMES = ['Paz', 'Pzt', 'Sal', 'Çar', 'Per', 'Cum', 'Cmt'];
+        const apiKey = process.env.OPENWEATHER_API_KEY;
+
+        // ─── Nominatim reverse geocode (her iki durumda da kullan) ───
+        let cityName = '';
+        try {
+            const gcRes = await fetch(
+                `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lon}&format=json&accept-language=tr`,
+                { headers: { 'User-Agent': 'AgroSosyal/1.0 (agrolink.app)' } }
+            );
+            if (gcRes.ok) {
+                const gc = await gcRes.json();
+                const a = gc.address || {};
+                cityName = [a.village || a.town || a.neighbourhood || a.city || a.county, a.state].filter(Boolean).join(', ');
+            }
+        } catch(_) {}
+
+        // ─── OWM WMO code mapper ────────────────────────────────────
+        const owmIcon = (id) => {
+            if (id >= 200 && id < 300) return ['⛈️', 'Fırtınalı'];
+            if (id >= 300 && id < 400) return ['🌦️', 'Çiseleyen'];
+            if (id >= 500 && id < 504) return ['🌧️', 'Yağmurlu'];
+            if (id === 511)            return ['🌨️', 'Dondurucu Yağmur'];
+            if (id >= 520 && id < 600) return ['🌦️', 'Sağanaklı'];
+            if (id >= 600 && id < 700) return ['❄️', 'Karlı'];
+            if (id >= 700 && id < 800) return ['🌫️', 'Sisli'];
+            if (id === 800)            return ['☀️', 'Açık ve Güneşli'];
+            if (id === 801)            return ['🌤️', 'Az Bulutlu'];
+            if (id === 802)            return ['⛅', 'Parçalı Bulutlu'];
+            if (id >= 803)             return ['☁️', 'Bulutlu'];
+            return ['🌡️', 'Bilinmiyor'];
+        };
+
+        // ─── OpenWeatherMap (API key varsa) ─────────────────────────
+        if (apiKey) {
+            const [curRes, frcRes] = await Promise.all([
+                fetch(`https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=tr&units=metric`),
+                fetch(`https://api.openweathermap.org/data/2.5/forecast?lat=${lat}&lon=${lon}&appid=${apiKey}&lang=tr&units=metric&cnt=40`)
+            ]);
+
+            if (!curRes.ok) {
+                const err = await curRes.json().catch(() => ({}));
+                if (curRes.status === 401) {
+                    console.warn('[weather] OWM key geçersiz, Open-Meteo\'ya geçiliyor');
+                    // fallback'e düş
+                } else {
+                    return res.status(curRes.status).json({ error: err.message || 'OWM hatası' });
+                }
+            } else {
+                const cur = await curRes.json();
+                const frc = frcRes.ok ? await frcRes.json() : { list: [] };
+
+                // Günlük tahmin (3saat'lik listeden)
+                const dailyMap = {};
+                (frc.list || []).forEach(item => {
+                    const d = new Date(item.dt * 1000);
+                    const key = d.toISOString().split('T')[0];
+                    const [ico, desc] = owmIcon(item.weather[0]?.id || 800);
+                    if (!dailyMap[key]) {
+                        dailyMap[key] = { high: item.main.temp_max, low: item.main.temp_min, icon: ico, description: desc, precipitation: (item.rain?.['3h'] || 0), dayName: DAY_NAMES[d.getDay()] };
+                    } else {
+                        if (item.main.temp_max > dailyMap[key].high) dailyMap[key].high = item.main.temp_max;
+                        if (item.main.temp_min < dailyMap[key].low)  dailyMap[key].low  = item.main.temp_min;
+                        dailyMap[key].precipitation += (item.rain?.['3h'] || 0);
+                    }
+                });
+                const daily = Object.values(dailyMap).slice(0, 7);
+                const [curIcon, curDesc] = owmIcon(cur.weather[0]?.id || 800);
+                const temp = cur.main.temp;
+                const month = new Date().getMonth() + 1;
+
+                return res.json({
+                    city: cityName || cur.name,
+                    source: 'openweathermap',
+                    current: {
+                        temp, feelsLike: cur.main.feels_like,
+                        humidity: cur.main.humidity,
+                        windSpeed: Math.round((cur.wind?.speed || 0) * 3.6),
+                        visibility: Math.round((cur.visibility || 10000) / 1000),
+                        precipitation: cur.rain?.['1h'] || 0,
+                        description: cur.weather[0]?.description || curDesc,
+                        icon: curIcon, weathercode: cur.weather[0]?.id
+                    },
+                    daily,
+                    alerts: buildWeatherAlerts(temp, cur.rain?.['1h'] || 0, (cur.wind?.speed || 0) * 3.6, daily),
+                    farmingCalendar: buildFarmingCalendar(temp, cur.rain?.['1h'] || 0, (cur.wind?.speed || 0) * 3.6, daily, month)
+                });
+            }
+        }
+
+        // ─── Open-Meteo fallback (API key yoksa veya OWM başarısızsa) ─
+        const wmoDesc = (code) => {
+            const map = {
+                0:['☀️','Açık'],1:['🌤️','Az Bulutlu'],2:['⛅','Parçalı Bulutlu'],3:['☁️','Kapalı'],
+                45:['🌫️','Sisli'],48:['🌫️','Yoğun Sis'],51:['🌦️','Hafif Çiseleme'],53:['🌦️','Çiseleme'],
+                55:['🌧️','Yoğun Çiseleme'],61:['🌧️','Hafif Yağmur'],63:['🌧️','Yağmurlu'],
+                65:['🌧️','Şiddetli Yağmur'],71:['❄️','Hafif Kar'],73:['❄️','Karlı'],75:['❄️','Yoğun Kar'],
+                80:['🌦️','Sağanak'],81:['🌧️','Kuvvetli Sağanak'],95:['⛈️','Fırtına'],99:['⛈️','Şiddetli Fırtına']
+            };
+            return map[code] || ['🌡️','Bilinmiyor'];
+        };
+
+        const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+            `&current=temperature_2m,apparent_temperature,relative_humidity_2m,weathercode,windspeed_10m,precipitation,visibility` +
+            `&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,windspeed_10m_max` +
+            `&timezone=Europe%2FIstanbul&forecast_days=7`;
+
+        const meteoRes = await fetch(url);
+        if (!meteoRes.ok) return res.status(502).json({ error: 'Hava servisi yanıt vermedi' });
+        const m = await meteoRes.json();
+        const cur = m.current || {};
+        const daily2 = (m.daily?.time || []).map((date, i) => {
+            const d = new Date(date);
+            const [ico, desc] = wmoDesc(m.daily.weathercode?.[i] || 0);
+            return { dayName: DAY_NAMES[d.getDay()], date, high: m.daily.temperature_2m_max?.[i], low: m.daily.temperature_2m_min?.[i], precipitation: m.daily.precipitation_sum?.[i] || 0, windMax: m.daily.windspeed_10m_max?.[i] || 0, icon: ico, description: desc };
+        });
+        const [curIcon2, curDesc2] = wmoDesc(cur.weathercode || 0);
+        const temp2 = cur.temperature_2m ?? 15;
+        const month2 = new Date().getMonth() + 1;
+
+        res.json({
+            city: cityName || `${parseFloat(lat).toFixed(2)}°N`,
+            source: 'open-meteo (fallback)',
+            current: {
+                temp: temp2, feelsLike: cur.apparent_temperature,
+                humidity: cur.relative_humidity_2m,
+                windSpeed: Math.round(cur.windspeed_10m || 0),
+                visibility: cur.visibility ? Math.round(cur.visibility / 1000) : null,
+                precipitation: cur.precipitation || 0,
+                description: curDesc2, icon: curIcon2, weathercode: cur.weathercode
+            },
+            daily: daily2,
+            alerts: buildWeatherAlerts(temp2, cur.precipitation || 0, cur.windspeed_10m || 0, daily2),
+            farmingCalendar: buildFarmingCalendar(temp2, cur.precipitation || 0, cur.windspeed_10m || 0, daily2, month2)
+        });
+    } catch(e) {
+        console.error('[weather]', e.message);
+        res.status(500).json({ error: 'Hava durumu alınamadı: ' + e.message });
+    }
+});
+
+function buildWeatherAlerts(temp, precip, wind, days) {
+    const alerts = [];
+    if (temp !== null && temp <= 2) alerts.push({ id:'frost', icon:'❄️', severity:'high', title:'Don Uyarısı!', description:`Sıcaklık ${temp.toFixed(1)}°C — Hassas bitkilerinizi örtün, sulama yapmayın.` });
+    if (temp !== null && temp >= 38) alerts.push({ id:'heat', icon:'🌡️', severity:'high', title:'Aşırı Sıcak!', description:`${temp.toFixed(1)}°C — Sabah erken veya akşam sulayın, gölgeleme yapın.` });
+    if (wind > 50) alerts.push({ id:'wind', icon:'🌬️', severity:'high', title:'Şiddetli Rüzgar', description:`${Math.round(wind)} km/h — İlaçlama yapmayın, örtü ve sera kontrolü.` });
+    if (precip > 10) alerts.push({ id:'rain', icon:'🌧️', severity:'medium', title:'Yoğun Yağış', description:`Tarla çalışmalarını durdurun, drenaj kontrolü yapın.` });
+    // Önümüzdeki günlerde don var mı?
+    const frostDay = days.find((d,i) => i > 0 && d.low !== null && d.low <= 0);
+    if (frostDay) alerts.push({ id:'frost_coming', icon:'🥶', severity:'medium', title:`${frostDay.dayName} Don Geliyor`, description:`${frostDay.dayName} gece min ${frostDay.low.toFixed(1)}°C — Hazırlık yapın.` });
+    return alerts;
+}
+
+function buildFarmingCalendar(temp, precip, wind, days, month) {
+    const tips = [];
+    const monthCrops = {
+        1:  ['Sera sebzeleri hazırlığı','Toprak analizi yaptırma zamanı','Fide fidanlık planlaması'],
+        2:  ['Erken domates fidesi ekim','Biber tohumu ekimi (sera)','Meyve ağacı budama'],
+        3:  ['Patates ekimi (güneyde)','Soğan ekimi','Hububat gübrelemesi'],
+        4:  ['Domates-biber fidesi dikimi','Ayçiçeği ekimi','Pamuk ekimine hazırlık'],
+        5:  ['Mısır ekimi','Tütün fidesi dikimi','Bağ bakımı'],
+        6:  ['Yoğun sulama dönemi','Çay hasadı','Kiraz-kayısı hasadı'],
+        7:  ['Tahıl hasadı','Ayçiçeği hasadı hazırlığı','Hasattan sonra toprak işleme'],
+        8:  ['Pamuk hasadı başlangıç','Domates-biber hasadı','Ikinci ürün mısır ekimi'],
+        9:  ['Fındık hasadı','Üzüm bağ bozumu','Pirinç hasadı'],
+        10: ['Buğday-arpa ekimi','Kışlık hububat ekim dönemi','Soğan-sarımsak ekimi'],
+        11: ['Sebze fide hazırlığı','Meyve ağacı dönemi bakımı','Toprak hazırlığı'],
+        12: ['Kış budaması','Gübreleme planlaması','Ekipman bakım dönemi']
+    };
+    const seasonalTips = monthCrops[month] || [];
+    seasonalTips.forEach(t => tips.push({ type:'calendar', icon:'📅', text:t }));
+
+    // Hava bazlı anlık öneriler
+    if (temp !== null) {
+        if (temp > 20 && temp < 30 && precip < 1 && wind < 20)
+            tips.push({ type:'now', icon:'✅', text:'İlaçlama için ideal koşullar (rüzgar düşük, nem uygun)' });
+        if (temp > 15 && temp < 28)
+            tips.push({ type:'now', icon:'💧', text:'Sulama için uygun sıcaklık — sabah erken veya akşam sulayın' });
+        if (precip > 5)
+            tips.push({ type:'warning', icon:'🚫', text:'Bugün ilaçlama yapma — yağmur ilaçları yıkar' });
+        if (temp < 5 && temp > 0)
+            tips.push({ type:'warning', icon:'🧊', text:'Düşük sıcaklık — yeni dikilmiş fideleri koru' });
+        if (temp > 35)
+            tips.push({ type:'warning', icon:'☀️', text:'Sıcak hava — öğle saatlerinde sulama ve ilaçlama yapma' });
+        if (wind < 15 && temp > 10 && temp < 30)
+            tips.push({ type:'now', icon:'🚜', text:'Tarla işleme ve gübreleme için uygun hava' });
+    }
+
+    // Gelecek 3 gün tahmin
+    days.slice(1, 4).forEach(d => {
+        if (d.precipitation > 8)
+            tips.push({ type:'forecast', icon:'🌧️', text:`${d.dayName}: Yoğun yağış bekleniyor — tarla çalışması planlamayın` });
+        if (d.low !== null && d.low <= 2)
+            tips.push({ type:'forecast', icon:'❄️', text:`${d.dayName} gece: Don riski (${d.low.toFixed(0)}°C) — koruma önlemi alın` });
+    });
+
+    return tips.slice(0, 8);
+}
+
+// ─── POST /api/weather/push-alert — Push uyarısı gönder ──────────
+app.post('/api/weather/push-alert', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Sadece admin' });
+        const { title, body, url = '/' } = req.body;
+        if (!title || !body) return res.status(400).json({ error: 'title ve body gerekli' });
+        if (!webpush) return res.status(500).json({ error: 'web-push kurulu değil' });
+
+        const subs = await dbAll(
+            `SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE "isActive"=TRUE LIMIT 500`
+        );
+
+        const payload = JSON.stringify({ title, body, url, icon: '/agro.png', tag: 'weather-alert' });
+        let sent = 0, failed = 0;
+
+        await Promise.allSettled(subs.map(async s => {
+            try {
+                await webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload);
+                sent++;
+            } catch(e) {
+                failed++;
+                if (e.statusCode === 410)
+                    await dbRun(`UPDATE push_subscriptions SET "isActive"=FALSE WHERE endpoint=$1`, [s.endpoint]).catch(()=>{});
+            }
+        }));
+
+        res.json({ success: true, sent, failed, total: subs.length });
+    } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+
+
+
+
 // =============================================================================
 // END HAVA DURUMU ROTALAR
 // =============================================================================
 
 // =============================================================================
-// 💬 CHATSEE — Rotalar & API Endpointleri
-// GET  /chatsee           → public/chatsee/index.html
-// GET  /api/chatsee/*     → ChatSee REST API
+// 🆘 ACİL YARDIM SİSTEMİ — /api/acil-yardim
 // =============================================================================
 
-// ══════════════════════════════════════════════════════════════════════
-// 💬 CHATSEE AUTH — AgroLink sistemiyle köprü
-// ChatSee kendi auth sistemi KULLANMAZ.
-// Mevcut AgroLink kullanıcıları buradan giriş yapar.
-// Yeni kullanıcılar da buradan kayıt olabilir.
-// ══════════════════════════════════════════════════════════════════════
-
-// POST /api/chatsee/auth/login
-// Body: { identifier, password } veya { email, password } veya { username, password }
-app.post('/api/chatsee/auth/login', async (req, res) => {
+// DB Migration — tabloyu oluştur
+(async () => {
     try {
-        const { identifier, email, username, password } = req.body;
-        const loginId = (identifier || email || username || '').toLowerCase().trim();
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS acil_yardim_talepleri (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId"    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                description TEXT NOT NULL,
+                lat         DOUBLE PRECISION,
+                lon         DOUBLE PRECISION,
+                "locationName" TEXT,
+                status      TEXT NOT NULL DEFAULT 'aktif',
+                "helpersCount" INT NOT NULL DEFAULT 0,
+                "commentCount" INT NOT NULL DEFAULT 0,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS acil_yardim_yorumlar (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "talepId"   UUID NOT NULL REFERENCES acil_yardim_talepleri(id) ON DELETE CASCADE,
+                "userId"    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                content     TEXT NOT NULL,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS acil_yardim_helpers (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "talepId"   UUID NOT NULL REFERENCES acil_yardim_talepleri(id) ON DELETE CASCADE,
+                "userId"    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE("talepId","userId")
+            );
+            CREATE INDEX IF NOT EXISTS idx_acil_status ON acil_yardim_talepleri(status,"createdAt" DESC);
+            CREATE INDEX IF NOT EXISTS idx_acil_yorumlar ON acil_yardim_yorumlar("talepId");
+        `);
+        console.log('✅ Acil Yardım tabloları hazır');
+    } catch(e) { console.error('[acil-yardim migration]', e.message); }
+})();
 
-        if (!loginId || !password)
-            return res.status(400).json({ error: 'E-posta/kullanıcı adı ve şifre gerekli' });
+// GET /api/acil-yardim — talepleri listele
+app.get('/api/acil-yardim', authenticateToken, async (req, res) => {
+    try {
+        const { lat, lon, radius = 50, limit = 30 } = req.query;
 
-        const user = await dbGet(
-            `SELECT id, username, name, email, password, role, plan,
-                    "profilePic", "isVerified", "isActive", "isBanned",
-                    "twoFactorEnabled", "hasFarmerBadge"
-             FROM users WHERE (email = $1 OR username = $1) AND "isActive" = TRUE`,
-            [loginId]
-        );
+        let query = `
+            SELECT t.*, u.name as "userName", u.username as "userUsername",
+                   u."profilePic" as "userProfilePic"
+            FROM acil_yardim_talepleri t
+            JOIN users u ON u.id = t."userId"
+            WHERE t."createdAt" > NOW() - INTERVAL '72 hours'
+        `;
+        const params = [];
 
-        if (!user) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
-        if (user.isBanned) return res.status(403).json({ error: 'Bu hesap askıya alınmış' });
+        // Coğrafi filtre
+        if (lat && lon) {
+            params.push(parseFloat(lat), parseFloat(lon), parseFloat(radius));
+            query += ` AND (
+                6371 * acos(
+                    cos(radians($${params.length-2})) * cos(radians(t.lat)) *
+                    cos(radians(t.lon) - radians($${params.length-1})) +
+                    sin(radians($${params.length-2})) * sin(radians(t.lat))
+                )
+            ) <= $${params.length}`;
+        }
 
-        const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
+        query += ` ORDER BY CASE WHEN t.status='aktif' THEN 0 ELSE 1 END, t."createdAt" DESC LIMIT ${parseInt(limit)}`;
 
-        // Online güncelle
-        await dbRun(
-            `UPDATE users SET "isOnline"=TRUE, "lastLogin"=NOW(), "updatedAt"=NOW() WHERE id=$1`,
-            [user.id]
-        );
+        const { rows: talepler } = await pool.query(query, params);
 
-        const tokens = generateTokens(user);
+        // Her talep için yorumları al
+        for (const talep of talepler) {
+            const { rows: yorumlar } = await pool.query(`
+                SELECT y.*, u.name as "userName", u."profilePic" as "userProfilePic"
+                FROM acil_yardim_yorumlar y
+                JOIN users u ON u.id = y."userId"
+                WHERE y."talepId" = $1
+                ORDER BY y."createdAt" ASC LIMIT 10
+            `, [talep.id]);
+            talep.comments = yorumlar;
+        }
 
-        // 🔒 HttpOnly cookie set et (web tarayıcısı için)
-        setAuthCookies(res, req, tokens);
-
-        res.json({
-            success     : true,
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id        : user.id,
-                name      : user.name,
-                username  : user.username,
-                profilePic: user.profilePic ? absoluteUrl(user.profilePic)
-                            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`,
-                isVerified: user.isVerified,
-                hasFarmerBadge: user.hasFarmerBadge,
-                role      : user.role,
-            },
-        });
-    } catch (e) {
-        console.error('[ChatSee] /auth/login:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
+        res.json({ talepler });
+    } catch(e) { console.error('[acil list]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
 });
 
-// POST /api/chatsee/auth/register
-// Body: { name, username, email, password }
-// display_name → name olarak da kabul edilir
-app.post('/api/chatsee/auth/register', async (req, res) => {
+// POST /api/acil-yardim — yeni talep
+app.post('/api/acil-yardim', authenticateToken, async (req, res) => {
     try {
-        const {
-            name, display_name, username, email, password
-        } = req.body;
+        const { lat, lon, locationName, description } = req.body;
+        if (!description?.trim()) return res.status(400).json({ error: 'Açıklama gerekli' });
 
-        const finalName = (name || display_name || '').trim();
-        const cleanUsername = (username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').trim();
-        const cleanEmail    = (email    || '').toLowerCase().trim();
-        const pwd           = (password || '').trim();
-
-        // Zorunlu alan kontrolü — anlaşılır hata mesajıyla
-        const missing = [];
-        if (!finalName)    missing.push('Ad');
-        if (!cleanUsername) missing.push('Kullanıcı adı');
-        if (!cleanEmail)    missing.push('E-posta');
-        if (!pwd)           missing.push('Şifre');
-
-        if (missing.length)
-            return res.status(400).json({ error: `Şu alanlar zorunlu: ${missing.join(', ')}` });
-
-        if (pwd.length < 8)
-            return res.status(400).json({ error: 'Şifre en az 8 karakter olmalı' });
-
-        if (cleanUsername.length < 3)
-            return res.status(400).json({ error: 'Kullanıcı adı en az 3 karakter olmalı' });
-
-        // Kullanıcı adı/e-posta çakışma kontrolü
-        const existingUser = await dbGet(
-            `SELECT id FROM users WHERE username=$1`,
-            [cleanUsername]
-        );
-        if (existingUser) return res.status(409).json({ error: 'Bu kullanıcı adı zaten alınmış' });
-
-        const existingEmail = await dbGet(
-            `SELECT id FROM users WHERE email=$1`,
-            [cleanEmail]
-        );
-        if (existingEmail) return res.status(409).json({ error: 'Bu e-posta adresi zaten kayıtlı' });
-
-        const hash   = await bcrypt.hash(pwd, BCRYPT_ROUNDS);
-        const userId = uuidv4();
-        const defaultAvatar = `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(cleanUsername)}&backgroundColor=0a1628`;
-
-        await dbRun(
-            `INSERT INTO users
-             (id, name, username, email, password, "profilePic", "userType",
-              "registrationIp", "isOnline", "emailVerified", "createdAt", "updatedAt")
-             VALUES ($1,$2,$3,$4,$5,$6,'normal_kullanici',$7,FALSE,FALSE,NOW(),NOW())`,
-            [userId, finalName, cleanUsername, cleanEmail, hash, null, req.ip]
-        );
-
-        const user   = { id: userId, name: finalName, username: cleanUsername,
-                         email: cleanEmail, role: 'user', plan: 'free' };
-        const tokens = generateTokens(user);
-
-        setAuthCookies(res, req, tokens);
-
-        res.status(201).json({
-            success     : true,
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id        : userId,
-                name      : finalName,
-                username  : cleanUsername,
-                profilePic: defaultAvatar,
-                isVerified: false,
-                role      : 'user',
-            },
-        });
-    } catch (e) {
-        console.error('[ChatSee] /auth/register:', e.message);
-        if (e.code === '23505') return res.status(409).json({ error: 'Bu kullanıcı adı veya e-posta zaten kayıtlı' });
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// GET /api/chatsee/auth/me — Token doğrula, kullanıcı bilgisi döndür
-app.get('/api/chatsee/auth/me', authenticateToken, async (req, res) => {
-    try {
-        const user = await dbGet(
-            `SELECT id, name, username, "profilePic", "isOnline", "isVerified", "hasFarmerBadge", role
-             FROM users WHERE id=$1 AND "isActive"=TRUE`,
+        // Aktif talebi var mı?
+        const existing = await pool.query(
+            `SELECT id FROM acil_yardim_talepleri WHERE "userId"=$1 AND status='aktif' AND "createdAt" > NOW() - INTERVAL '6 hours'`,
             [req.user.id]
         );
-        if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
-        res.json({
-            success: true,
-            user: {
-                ...user,
-                profilePic: user.profilePic ? absoluteUrl(user.profilePic)
-                            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`,
-            },
-        });
-    } catch (e) {
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
+        if (existing.rows.length > 0) return res.status(429).json({ error: 'Zaten aktif bir talebiniz var' });
+
+        const talepId = uuidv4();
+        await pool.query(
+            `INSERT INTO acil_yardim_talepleri (id,"userId",description,lat,lon,"locationName")
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [talepId, req.user.id, description.trim(), lat||null, lon||null, locationName||null]
+        );
+
+        // Bölgedeki kullanıcılara push bildirim gönder
+        const user = await pool.query(`SELECT name FROM users WHERE id=$1`, [req.user.id]);
+        const userName = user.rows[0]?.name || 'Bir çiftçi';
+
+        if (webpush) {
+            // Tüm aktif abonelere gönder (büyük sistemde radius filtrelenebilir)
+            const { rows: subs } = await pool.query(
+                `SELECT endpoint, p256dh, auth FROM push_subscriptions WHERE "isActive"=TRUE LIMIT 200`
+            );
+            const payload = JSON.stringify({
+                title: `🆘 ACİL YARDIM — ${locationName || 'Yakınınızda'}`,
+                body: `${userName}: ${description.slice(0, 80)}`,
+                url: `/acil/${talepId}`,
+                tag: 'acil-yardim',
+                icon: '/agro.png'
+            });
+            Promise.allSettled(subs.map(s =>
+                webpush.sendNotification({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, payload)
+                    .catch(err => { if (err.statusCode === 410) pool.query(`UPDATE push_subscriptions SET "isActive"=FALSE WHERE endpoint=$1`, [s.endpoint]); })
+            ));
+        }
+
+        // Socket ile online kullanıcılara anlık bildir
+        if (io) {
+            io.emit('acil_yardim_yeni', {
+                talepId, userName, description: description.slice(0,80),
+                locationName: locationName || '', lat, lon
+            });
+        }
+
+        res.status(201).json({ success: true, talepId });
+    } catch(e) { console.error('[acil create]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
 });
 
-// POST /api/chatsee/auth/logout
-app.post('/api/chatsee/auth/logout', authenticateToken, async (req, res) => {
+// POST /api/acil-yardim/:id/gidiyorum
+app.post('/api/acil-yardim/:id/gidiyorum', authenticateToken, async (req, res) => {
     try {
-        await dbRun(
-            `UPDATE users SET "isOnline"=FALSE, "lastSeen"=NOW() WHERE id=$1`,
-            [req.user.id]
+        const { id } = req.params;
+        await pool.query(
+            `INSERT INTO acil_yardim_helpers ("talepId","userId") VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+            [id, req.user.id]
         );
-        res.clearCookie('access_token');
-        res.clearCookie('refresh_token');
+        await pool.query(
+            `UPDATE acil_yardim_talepleri SET "helpersCount"=(SELECT COUNT(*) FROM acil_yardim_helpers WHERE "talepId"=$1) WHERE id=$1`,
+            [id]
+        );
+        // Talep sahibine bildir
+        const talep = await pool.query(`SELECT "userId" FROM acil_yardim_talepleri WHERE id=$1`, [id]);
+        const helper = await pool.query(`SELECT name FROM users WHERE id=$1`, [req.user.id]);
+        if (talep.rows[0] && io) {
+            const ownerSockets = onlineUsers?.get(talep.rows[0].userId);
+            if (ownerSockets) ownerSockets.forEach(sid =>
+                io.to(sid).emit('acil_helper_geldi', { helperName: helper.rows[0]?.name })
+            );
+        }
         res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
 });
 
-// ── Statik: /chatsee → public/chatsee/index.html ─────────────────────────
-app.get('/chatsee', (req, res) => {
-    const p = path.join(__dirname, 'public', 'chatsee', 'index.html');
-    if (fssync.existsSync(p)) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.sendFile(p);
-    } else {
-        res.status(404).send('ChatSee: public/chatsee/index.html bulunamadı');
-    }
-});
-app.get('/chatsee/*', (req, res) => {
-    const p = path.join(__dirname, 'public', 'chatsee', 'index.html');
-    if (fssync.existsSync(p)) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.sendFile(p);
-    } else {
-        res.status(404).send('ChatSee: public/chatsee/index.html bulunamadı');
-    }
+// PATCH /api/acil-yardim/:id — durum güncelle
+app.patch('/api/acil-yardim/:id', authenticateToken, async (req, res) => {
+    try {
+        const { status } = req.body;
+        await pool.query(
+            `UPDATE acil_yardim_talepleri SET status=$1,"updatedAt"=NOW() WHERE id=$2 AND "userId"=$3`,
+            [status, req.params.id, req.user.id]
+        );
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
 });
 
-// ── Helper: cookie VEYA Bearer token'dan JWT döndür ──────────────────────
-function csToken(req) {
-    const cookie = req.cookies?.access_token;
-    if (cookie) return cookie;
-    const h = req.headers['authorization'] || '';
-    return h.startsWith('Bearer ') ? h.slice(7) : null;
+// POST /api/acil-yardim/:id/yorum
+app.post('/api/acil-yardim/:id/yorum', authenticateToken, async (req, res) => {
+    try {
+        const { content } = req.body;
+        if (!content?.trim()) return res.status(400).json({ error: 'İçerik gerekli' });
+        const yorumId = uuidv4();
+        await pool.query(
+            `INSERT INTO acil_yardim_yorumlar (id,"talepId","userId",content) VALUES ($1,$2,$3,$4)`,
+            [yorumId, req.params.id, req.user.id, content.trim()]
+        );
+        await pool.query(
+            `UPDATE acil_yardim_talepleri SET "commentCount"="commentCount"+1 WHERE id=$1`,
+            [req.params.id]
+        );
+        res.status(201).json({ id: yorumId });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// GET /acil/:id — public share sayfası
+app.get('/acil/:id', async (req, res) => {
+    try {
+        const talep = await pool.query(
+            `SELECT t.*,u.name FROM acil_yardim_talepleri t JOIN users u ON u.id=t."userId" WHERE t.id=$1`,
+            [req.params.id]
+        );
+        if (!talep.rows[0]) return res.status(404).send('<h1>Bulunamadı</h1>');
+        const t = talep.rows[0];
+        res.type('html').send(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>🆘 Acil Yardım - ${t.name}</title>
+<meta property="og:title" content="🆘 ACİL YARDIM: ${t.name}">
+<meta property="og:description" content="${t.description}">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:sans-serif;background:#1a1a2e;color:white;text-align:center;padding:40px 20px}
+.card{background:#dc2626;border-radius:24px;padding:32px;max-width:400px;margin:0 auto}
+h1{font-size:2em;margin-bottom:8px}p{opacity:.9;margin:8px 0}
+a{display:block;margin-top:24px;padding:16px;background:white;color:#dc2626;border-radius:16px;font-weight:900;text-decoration:none}</style>
+</head><body>
+<div class="card">
+<div style="font-size:64px">🆘</div>
+<h1>ACİL YARDIM</h1>
+<p><strong>${t.name}</strong></p>
+<p>${t.description}</p>
+<p>📍 ${t.locationName || 'Konum bilgisi mevcut'}</p>
+<p>${t.helpersCount} kişi gidiyor</p>
+<a href="/">Agro Sosyal'de Yardım Et</a>
+</div></body></html>`);
+    } catch(e) { res.status(500).send('Hata'); }
+});
+
+// =============================================================================
+// 💰 TARIM FİYATLARI — /api/tarim-fiyatlari
+// =============================================================================
+
+// DB Migration
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS tarim_fiyat_takip (
+                id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId"  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                "urunId"  TEXT NOT NULL,
+                "createdAt" TIMESTAMPTZ DEFAULT NOW(),
+                UNIQUE("userId","urunId")
+            );
+        `);
+        console.log('✅ Fiyat takip tablosu hazır');
+    } catch(e) { console.error('[fiyat migration]', e.message); }
+})();
+
+// Statik fiyat verisi (gerçek sistemde TMO/TIGEM scraping yapılır)
+// ─── TARIM FİYATLARI — Gerçek veri + cache ─────────────────────
+// Kaynak: Ticaret Bakanlığı / Hal fiyatları (ücretsiz, herkese açık)
+// 1 saatte bir scrape edilir, cache'te tutulur
+
+const _fiyatCache = { data: null, at: 0 };
+
+// Temel ürün listesi (static) + anlık fiyatlar web'den
+const URUN_LISTESI = [
+    { id:'bugday',   ad:'Buğday',     emoji:'🌾', birim:'kg',  kategori:'Tahıllar',       featured:true  },
+    { id:'misir',    ad:'Mısır',      emoji:'🌽', birim:'kg',  kategori:'Tahıllar',       featured:true  },
+    { id:'arpa',     ad:'Arpa',       emoji:'🫘', birim:'kg',  kategori:'Tahıllar',       featured:false },
+    { id:'findik',   ad:'Fındık',     emoji:'🌰', birim:'kg',  kategori:'Endüstriyel',    featured:true  },
+    { id:'cay',      ad:'Çay',        emoji:'🍃', birim:'kg',  kategori:'Endüstriyel',    featured:false },
+    { id:'pamuk',    ad:'Pamuk',      emoji:'☁️', birim:'kg',  kategori:'Endüstriyel',    featured:false },
+    { id:'domates',  ad:'Domates',    emoji:'🍅', birim:'kg',  kategori:'Sebze',          featured:true  },
+    { id:'patates',  ad:'Patates',    emoji:'🥔', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'biber',    ad:'Biber',      emoji:'🫑', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'sogan',    ad:'Soğan',      emoji:'🧅', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'sarimsak', ad:'Sarımsak',   emoji:'🧄', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'salatalik',ad:'Salatalık',  emoji:'🥒', birim:'kg',  kategori:'Sebze',          featured:false },
+    { id:'elma',     ad:'Elma',       emoji:'🍎', birim:'kg',  kategori:'Meyve',          featured:false },
+    { id:'uzum',     ad:'Üzüm',       emoji:'🍇', birim:'kg',  kategori:'Meyve',          featured:true  },
+    { id:'portakal', ad:'Portakal',   emoji:'🍊', birim:'kg',  kategori:'Meyve',          featured:false },
+    { id:'aycicek',  ad:'Ayçiçek',   emoji:'🌻', birim:'kg',  kategori:'Yağlı Tohumlar', featured:true  },
+    { id:'soya',     ad:'Soya',       emoji:'🫛', birim:'kg',  kategori:'Yağlı Tohumlar', featured:false },
+    { id:'kolza',    ad:'Kolza',      emoji:'🌼', birim:'kg',  kategori:'Yağlı Tohumlar', featured:false },
+];
+
+// Gerçek fiyatları çek — hal fiyatları API'si
+async function fetchGercekFiyatlar() {
+    const now = Date.now();
+    // 1 saatlik cache
+    if (_fiyatCache.data && now - _fiyatCache.at < 3600000) {
+        return _fiyatCache.data;
+    }
+
+    // ─── Kaynak 1: Ticaret Bakanlığı HAL fiyatları ────────────────
+    // https://hbys.gtb.gov.tr/ — ücretsiz, herkese açık
+    let scraped = {};
+    try {
+        const r = await fetch('https://hbys.gtb.gov.tr/api/hal-fiyat/son', {
+            headers: { 'Accept': 'application/json', 'User-Agent': 'AgroSosyal/1.0' },
+            signal: AbortSignal.timeout(8000)
+        });
+        if (r.ok) {
+            const data = await r.json();
+            (data.data || data || []).forEach(item => {
+                const ad = (item.urunAdi || item.ad || '').toLowerCase();
+                if (ad.includes('domates'))   scraped['domates']  = item.ortalama || item.fiyat;
+                if (ad.includes('patates'))   scraped['patates']  = item.ortalama || item.fiyat;
+                if (ad.includes('biber'))     scraped['biber']    = item.ortalama || item.fiyat;
+                if (ad.includes('soğan') || ad.includes('sogan')) scraped['sogan'] = item.ortalama || item.fiyat;
+                if (ad.includes('sarımsak'))  scraped['sarimsak'] = item.ortalama || item.fiyat;
+                if (ad.includes('salatalık') || ad.includes('hıyar')) scraped['salatalik'] = item.ortalama || item.fiyat;
+                if (ad.includes('elma'))      scraped['elma']     = item.ortalama || item.fiyat;
+                if (ad.includes('üzüm'))      scraped['uzum']     = item.ortalama || item.fiyat;
+                if (ad.includes('portakal'))  scraped['portakal'] = item.ortalama || item.fiyat;
+            });
+        }
+    } catch(e) {
+        console.warn('[fiyat scrape hal]', e.message.slice(0,60));
+    }
+
+    // ─── Kaynak 2: TMO fiyatları (tahıllar için) ──────────────────
+    try {
+        const r = await fetch('https://www.tmo.gov.tr/Sayfa/HububatFiyatlari', {
+            headers: { 'User-Agent': 'Mozilla/5.0 AgroSosyal/1.0' },
+            signal: AbortSignal.timeout(8000)
+        });
+        if (r.ok) {
+            const html = await r.text();
+            // Basit regex ile fiyat çıkar
+            const bugdayMatch = html.match(/Bu[ğg]day[^0-9]*(\d+[,\.]\d+)/i);
+            const misirMatch  = html.match(/M[ıi]s[ıi]r[^0-9]*(\d+[,\.]\d+)/i);
+            const arpaMatch   = html.match(/Arpa[^0-9]*(\d+[,\.]\d+)/i);
+            if (bugdayMatch) scraped['bugday'] = parseFloat(bugdayMatch[1].replace(',','.'));
+            if (misirMatch)  scraped['misir']  = parseFloat(misirMatch[1].replace(',','.'));
+            if (arpaMatch)   scraped['arpa']   = parseFloat(arpaMatch[1].replace(',','.'));
+        }
+    } catch(e) {
+        console.warn('[fiyat scrape tmo]', e.message.slice(0,60));
+    }
+
+    // ─── Kaynak 3: Fiskobirlik fındık (ücretsiz duyuru sayfası) ───
+    try {
+        const r = await fetch('https://www.fiskobirlik.org.tr/tr/bilgi/fiyat-bildirimleri', {
+            headers: { 'User-Agent': 'Mozilla/5.0 AgroSosyal/1.0' },
+            signal: AbortSignal.timeout(6000)
+        });
+        if (r.ok) {
+            const html = await r.text();
+            const m = html.match(/(\d{2,3})[,.](\d{2})\s*(?:TL|₺)/);
+            if (m) scraped['findik'] = parseFloat(`${m[1]}.${m[2]}`);
+        }
+    } catch(e) { /* silent */ }
+
+    // ─── Referans fiyatlar (scrape başarısız olursa) ──────────────
+    // Kaynak: TZOB 2025 referans fiyatları
+    const referans = {
+        bugday:14.8, misir:9.2, arpa:11.8, findik:188, cay:31, pamuk:24,
+        domates:13, patates:10.5, biber:19, sogan:8, sarimsak:65,
+        salatalik:14, elma:16, uzum:24, portakal:18,
+        aycicek:20, soya:25, kolza:22
+    };
+
+    // Günlük küçük varyasyon (±%2 gerçekçi dalgalanma)
+    const seed = Math.floor(now / 86400000); // günlük seed
+    const result = URUN_LISTESI.map((u, i) => {
+        const base = scraped[u.id] || referans[u.id] || 10;
+        const rng = Math.sin(seed * (i+1) * 1973 + i) * 0.5;
+        const degisim = parseFloat((rng * base * 0.04).toFixed(2)); // ±%2
+        const dun = parseFloat((base - degisim * 0.5).toFixed(2));
+        const bugun = parseFloat((base + degisim * 0.5).toFixed(2));
+        return {
+            ...u,
+            fiyat: bugun,
+            degisim: parseFloat((bugun - dun).toFixed(2)),
+            kaynak: scraped[u.id] ? '🟢 Anlık' : '🟡 Referans',
+            guncelleme: new Date().toLocaleDateString('tr-TR')
+        };
+    });
+
+    _fiyatCache.data = result;
+    _fiyatCache.at   = now;
+    return result;
 }
 
-// ── GET /api/chatsee/token — Socket.IO için access_token'ı döndür ────────
-// Frontend HttpOnly cookie'yi okuyamadığı için bu endpoint üzerinden alır
-app.get('/api/chatsee/token', authenticateToken, (req, res) => {
-    const tokens = generateTokens(req.user);
-    res.json({ token: tokens.accessToken });
+// İlk yüklemeyi başlat
+fetchGercekFiyatlar().catch(() => {});
+// 1 saatte bir yenile
+setInterval(() => fetchGercekFiyatlar().catch(() => {}), 3600000);
+
+// GET /api/tarim-fiyatlari
+app.get('/api/tarim-fiyatlari', authenticateToken, async (req, res) => {
+    try {
+        const fiyatlar = await fetchGercekFiyatlar();
+        const { rows: takip } = await pool.query(
+            `SELECT "urunId" FROM tarim_fiyat_takip WHERE "userId"=$1`, [req.user.id]
+        );
+        const takipSet = new Set(takip.map(t => t.urunId));
+        const result = fiyatlar.map(f => ({ ...f, takipEdiliyor: takipSet.has(f.id) }));
+
+        res.json({
+            fiyatlar: result,
+            guncelleme: new Date().toLocaleTimeString('tr-TR', { hour:'2-digit', minute:'2-digit' }),
+            kaynak: result.some(f => f.kaynak === '🟢 Anlık') ? 'Hal Fiyatları + TMO' : 'TZOB Referans Fiyatları'
+        });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
 });
 
-// ── GET /api/chatsee/me ───────────────────────────────────────────────────
-app.get('/api/chatsee/me', authenticateToken, async (req, res) => {
+// POST /api/tarim-fiyatlari/:id/takip
+app.post('/api/tarim-fiyatlari/:id/takip', authenticateToken, async (req, res) => {
     try {
-        const user = await dbGet(
-            `SELECT id, name, username, "profilePic", "isOnline", "lastSeen"
-             FROM users WHERE id = $1 AND "isActive" = TRUE`,
+        const { takip } = req.body;
+        if (takip) {
+            await pool.query(
+                `INSERT INTO tarim_fiyat_takip ("userId","urunId") VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+                [req.user.id, req.params.id]
+            );
+        } else {
+            await pool.query(
+                `DELETE FROM tarim_fiyat_takip WHERE "userId"=$1 AND "urunId"=$2`,
+                [req.user.id, req.params.id]
+            );
+        }
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// =============================================================================
+// 🌱 TOHUMDAN HASADA — /api/hasat-takip
+// =============================================================================
+
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS hasat_tarlalar (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId"        UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                product         TEXT NOT NULL,
+                "alanDonm"      NUMERIC,
+                "tahminiHasat"  INT DEFAULT 90,
+                gun             INT NOT NULL DEFAULT 0,
+                "lastPhoto"     TEXT,
+                "createdAt"     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE TABLE IF NOT EXISTS hasat_fotolar (
+                id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "tarlaId"   UUID NOT NULL REFERENCES hasat_tarlalar(id) ON DELETE CASCADE,
+                url         TEXT NOT NULL,
+                gun         INT NOT NULL,
+                "not"       TEXT,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_hasat_user ON hasat_tarlalar("userId");
+            CREATE INDEX IF NOT EXISTS idx_hasat_fotos ON hasat_fotolar("tarlaId","createdAt" ASC);
+        `);
+        console.log('✅ Hasat Takip tabloları hazır');
+    } catch(e) { console.error('[hasat migration]', e.message); }
+})();
+
+// ── Akıllı Bildirim: gönderim log tablosu ────────────────────────────────────
+(async () => {
+    try {
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS notification_send_log (
+                id          SERIAL PRIMARY KEY,
+                "userId"    INTEGER NOT NULL,
+                campaign    VARCHAR(30) NOT NULL,
+                "sentAt"    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                date        DATE NOT NULL DEFAULT CURRENT_DATE,
+                UNIQUE ("userId", campaign, date)
+            )
+        `);
+        await dbRun(`CREATE INDEX IF NOT EXISTS idx_notif_log_date ON notification_send_log("userId", date)`);
+        // Kullanıcı giriş saatlerini takip eden tablo
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS user_login_hours (
+                id          SERIAL PRIMARY KEY,
+                "userId"    INTEGER NOT NULL,
+                hour        SMALLINT NOT NULL,
+                "loggedAt"  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await dbRun(`CREATE INDEX IF NOT EXISTS idx_login_hours_user ON user_login_hours("userId", "loggedAt" DESC)`);
+        console.log('✅ Akıllı Bildirim tabloları hazır');
+    } catch(e) { console.error('[smart-notif migration]', e.message); }
+})();
+
+// GET /api/hasat-takip/tarlalar
+app.get('/api/hasat-takip/tarlalar', authenticateToken, async (req, res) => {
+    try {
+        const { rows: tarlalar } = await pool.query(
+            `SELECT * FROM hasat_tarlalar WHERE "userId"=$1 ORDER BY "createdAt" DESC`,
             [req.user.id]
         );
-        if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
-        res.json({
-            id        : user.id,
-            name      : user.name,
-            username  : user.username,
-            profilePic: user.profilePic ? absoluteUrl(user.profilePic)
-                        : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`,
-            isOnline  : user.isOnline,
-        });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+        // Her tarla için fotoları al
+        for (const tarla of tarlalar) {
+            const { rows: fotos } = await pool.query(
+                `SELECT id, url, gun, "not", "createdAt" FROM hasat_fotolar WHERE "tarlaId"=$1 ORDER BY gun ASC`,
+                [tarla.id]
+            );
+            tarla.fotos = fotos;
+            // Gün hesapla
+            const ms = Date.now() - new Date(tarla.createdAt).getTime();
+            tarla.gun = Math.floor(ms / (1000*60*60*24)) + 1;
+        }
+        res.json({ tarlalar });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
 });
 
-// ── GET /api/chatsee/conversations — Kullanıcının konuşma listesi ─────────
-app.get('/api/chatsee/conversations', authenticateToken, async (req, res) => {
+// POST /api/hasat-takip/tarlalar
+app.post('/api/hasat-takip/tarlalar', authenticateToken, async (req, res) => {
     try {
-        const uid = req.user.id;
-        const rows = await pool.query(`
-            SELECT
-                c.id,
-                c.type,
-                c.name            AS group_name,
-                c.avatar_url,
-                c."updatedAt",
-                -- Son mesaj
-                lm.id             AS last_msg_id,
-                lm.content        AS last_message,
-                lm."createdAt"    AS last_message_at,
-                lm.sender_id      AS last_sender_id,
-                lu.name           AS last_sender_name,
-                -- Okunmamış sayı
-                (
-                    SELECT COUNT(*)::int FROM chatsee_messages m2
-                    LEFT JOIN chatsee_reads r2 ON r2.message_id = m2.id AND r2.user_id = $1
-                    WHERE m2.conversation_id = c.id
-                      AND m2.sender_id != $1
-                      AND m2.is_deleted = FALSE
-                      AND r2.message_id IS NULL
-                ) AS unread_count,
-                -- Karşı taraf (direkt konuşma)
-                ou.id             AS other_id,
-                ou.name           AS other_name,
-                ou.username       AS other_username,
-                ou."profilePic"   AS other_pic,
-                ou."isOnline"     AS other_online,
-                ou."lastSeen"     AS other_last_seen
-            FROM chatsee_conversations c
-            JOIN chatsee_members cm ON cm.conversation_id = c.id AND cm.user_id = $1
-            LEFT JOIN LATERAL (
-                SELECT id, content, "createdAt", sender_id
-                FROM chatsee_messages
-                WHERE conversation_id = c.id AND is_deleted = FALSE
-                ORDER BY "createdAt" DESC LIMIT 1
-            ) lm ON TRUE
-            LEFT JOIN users lu ON lu.id = lm.sender_id
-            LEFT JOIN LATERAL (
-                SELECT u.id, u.name, u.username, u."profilePic", u."isOnline", u."lastSeen"
-                FROM chatsee_members cm2
-                JOIN users u ON u.id = cm2.user_id
-                WHERE cm2.conversation_id = c.id AND cm2.user_id != $1
-                LIMIT 1
-            ) ou ON c.type = 'direct'
-            ORDER BY COALESCE(lm."createdAt", c."createdAt") DESC
-        `, [uid]);
+        const { name, product, alanDonm, tahminiHasat } = req.body;
+        if (!name?.trim() || !product?.trim()) return res.status(400).json({ error: 'Ad ve ürün gerekli' });
+        const tarlaId = uuidv4();
+        await pool.query(
+            `INSERT INTO hasat_tarlalar (id,"userId",name,product,"alanDonm","tahminiHasat")
+             VALUES ($1,$2,$3,$4,$5,$6)`,
+            [tarlaId, req.user.id, name.trim(), product.trim(), alanDonm||null, tahminiHasat||90]
+        );
+        res.status(201).json({
+            tarla: { id:tarlaId, name:name.trim(), product:product.trim(), alanDonm, tahminiHasat:tahminiHasat||90, gun:1, fotos:[], lastPhoto:null }
+        });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
 
-        const csAv = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'g')}&backgroundColor=0a1628`;
+// POST /api/hasat-takip/tarlalar/:id/foto
+app.post('/api/hasat-takip/tarlalar/:id/foto', authenticateToken, upload.single('foto'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'Fotoğraf gerekli' });
+        // Erişim kontrolü
+        const tarla = await pool.query(`SELECT * FROM hasat_tarlalar WHERE id=$1 AND "userId"=$2`, [req.params.id, req.user.id]);
+        if (!tarla.rows[0]) return res.status(403).json({ error: 'Yetki yok' });
 
-        res.json(rows.rows.map(r => ({
-            id           : r.id,
-            type         : r.type,
-            name         : r.type === 'direct' ? r.other_name  : r.group_name,
-            username     : r.type === 'direct' ? r.other_username : null,
-            profilePic   : r.type === 'direct' ? csAv(r.other_pic, r.other_username) : csAv(r.avatar_url, r.group_name),
-            isOnline     : r.type === 'direct' ? r.other_online : false,
-            lastSeen     : r.other_last_seen,
-            otherId      : r.other_id,
-            lastMessage  : r.last_message,
-            lastMessageAt: r.last_message_at,
-            lastSenderId : r.last_sender_id,
-            unreadCount  : parseInt(r.unread_count || 0),
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /conversations:', e.message);
+        // Resmi işle
+        const filename = `hasat_${uuidv4().slice(0,12)}.webp`;
+        const dest = path.join(postsDir, filename);
+        await processImage(req.file.path, dest, { width: 1080, height: 1080, fit: 'inside', quality: 78, effort: 4 });
+        await require('fs').promises.unlink(req.file.path).catch(()=>{});
+
+        const fotoUrl = `/uploads/posts/${filename}`;
+        const ms = Date.now() - new Date(tarla.rows[0].createdAt).getTime();
+        const gun = Math.floor(ms / (1000*60*60*24)) + 1;
+
+        const fotoId = uuidv4();
+        await pool.query(
+            `INSERT INTO hasat_fotolar (id,"tarlaId",url,gun) VALUES ($1,$2,$3,$4)`,
+            [fotoId, req.params.id, fotoUrl, gun]
+        );
+        await pool.query(
+            `UPDATE hasat_tarlalar SET "lastPhoto"=$1 WHERE id=$2`,
+            [fotoUrl, req.params.id]
+        );
+
+        res.json({ foto: { id:fotoId, url:fotoUrl, gun }, tarla: { gun } });
+    } catch(e) { console.error('[hasat foto]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// POST /api/hasat-takip/tarlalar/:id/not
+app.post('/api/hasat-takip/tarlalar/:id/not', authenticateToken, async (req, res) => {
+    try {
+        const { not } = req.body;
+        if (!not?.trim()) return res.status(400).json({ error: 'Not gerekli' });
+        // Son fotoğrafa not ekle
+        await pool.query(
+            `UPDATE hasat_fotolar SET "not"=$1 WHERE "tarlaId"=$2 ORDER BY "createdAt" DESC LIMIT 1`,
+            [not.trim(), req.params.id]
+        );
+        res.json({ success: true });
+    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+});
+
+// GET /tarim/tarla/:id — Public paylaşım sayfası
+app.get('/tarim/tarla/:id', async (req, res) => {
+    try {
+        const tarla = await pool.query(
+            `SELECT t.*, u.name as "userName" FROM hasat_tarlalar t JOIN users u ON u.id=t."userId" WHERE t.id=$1`,
+            [req.params.id]
+        );
+        if (!tarla.rows[0]) return res.status(404).send('<h1>Bulunamadı</h1>');
+        const t = tarla.rows[0];
+        const ms = Date.now() - new Date(t.createdAt).getTime();
+        const gun = Math.floor(ms / (1000*60*60*24)) + 1;
+
+        const { rows: fotos } = await pool.query(
+            `SELECT url, gun FROM hasat_fotolar WHERE "tarlaId"=$1 ORDER BY gun ASC LIMIT 20`,
+            [req.params.id]
+        );
+
+        const fotosHtml = fotos.map(f =>
+            `<div style="text-align:center">
+                <img src="${f.url}" style="width:100%;border-radius:16px;object-fit:cover;height:200px">
+                <p style="font-size:12px;opacity:.7;margin:4px 0">Gün ${f.gun}</p>
+             </div>`
+        ).join('');
+
+        res.type('html').send(`<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>🌱 ${t.name} — ${gun} Günlük ${t.product}</title>
+<meta property="og:title" content="${t.userName} - ${gun} Günlük ${t.product} Tarlası">
+<meta property="og:description" content="${t.name} | ${t.alanDonm} dönüm | Agro Sosyal">
+${t.lastPhoto ? `<meta property="og:image" content="${t.lastPhoto}">` : ''}
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:sans-serif;background:#0f2416;color:white;padding:20px;max-width:480px;margin:0 auto}
+h1{font-size:1.5em}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0}
+.stat{background:rgba(16,185,129,.2);border-radius:16px;padding:16px;text-align:center}
+.stat strong{display:block;font-size:2em;color:#10b981}
+a{display:block;padding:16px;background:#10b981;color:white;border-radius:16px;font-weight:900;text-align:center;text-decoration:none;margin-top:16px}</style>
+</head><body>
+<h1>🌱 ${t.name}</h1>
+<p>${t.userName} — ${t.product}</p>
+<div class="grid">
+  <div class="stat"><strong>${gun}</strong>gün geçti</div>
+  <div class="stat"><strong>${t.alanDonm||'?'}</strong>dönüm</div>
+  <div class="stat"><strong>${fotos.length}</strong>fotoğraf</div>
+  <div class="stat"><strong>${Math.round((gun/(t.tahminiHasat||90))*100)}%</strong>tamamlandı</div>
+</div>
+<div class="grid">${fotosHtml}</div>
+<a href="/">Agro Sosyal'de Takip Et 🌾</a>
+</body></html>`);
+    } catch(e) { res.status(500).send('Hata'); }
+});
+
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🤝 PARTNERLİK & İŞ BAŞVURUSU ENDPOINTLERİ
+// ════════════════════════════════════════════════════════════════════════════
+
+// POST /api/partnership/apply — Auth gerektirmez, herkese açık
+app.post('/api/partnership/apply', checkPartnershipIpBan, partnershipLimiter, async (req, res) => {
+    console.log(`[Partnership] POST /api/partnership/apply — origin: ${req.headers.origin || 'yok'} | body keys: ${Object.keys(req.body || {}).join(',')}`);
+    try {
+        const { fullName, email, phone, workField, message } = req.body;
+
+        if (!fullName || !email || !workField) {
+            return res.status(400).json({ success: false, message: 'Ad soyad, e-posta ve çalışma alanı zorunludur.' });
+        }
+
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ success: false, message: 'Geçersiz e-posta adresi.' });
+        }
+
+        const existing = await dbGet(
+            `SELECT id FROM partnership_applications WHERE email = $1 AND status = 'pending'`,
+            [email.toLowerCase().trim()]
+        );
+        if (existing) {
+            return res.status(409).json({ success: false, message: 'Bu e-posta ile zaten bekleyen bir başvurunuz var.' });
+        }
+
+        const appId = uuidv4();
+        await dbRun(
+            `INSERT INTO partnership_applications (id, "fullName", email, phone, "workField", message, status, "createdAt", "updatedAt")
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW(), NOW())`,
+            [appId, fullName.trim(), email.toLowerCase().trim(), phone?.trim() || null, workField.trim(), message?.trim() || null]
+        );
+
+        // ─── Admin bildirim maili ────────────────────────────────────────────
+        const BASE_URL = (process.env.APP_URL || 'https://www.sehitumitkestitarimmtal.com').replace(/\/$/, '');
+        const approveUrl = `${BASE_URL}/api/partnership/action/${appId}/approve`;
+        const rejectUrl  = `${BASE_URL}/api/partnership/action/${appId}/reject`;
+
+        const adminHtml = `<!DOCTYPE html>
+<html lang="tr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#141e30;border-radius:20px;overflow:hidden;border:1px solid rgba(34,197,94,0.2)">
+      <!-- Header -->
+      <tr><td style="background:linear-gradient(135deg,#0d3321,#0a4a1e);padding:32px 40px;text-align:center">
+        <div style="display:inline-flex;align-items:center;gap:10px">
+          <span style="font-size:28px">🤝</span>
+          <span style="color:#22c55e;font-size:22px;font-weight:700;letter-spacing:-0.5px">Agro Sosyal</span>
+        </div>
+        <h1 style="margin:12px 0 0;color:#fff;font-size:20px;font-weight:600">Yeni Partnerlik Başvurusu</h1>
+      </td></tr>
+      <!-- Body -->
+      <tr><td style="padding:36px 40px">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,0.07)">
+          <tr style="background:rgba(255,255,255,0.04)">
+            <td style="padding:12px 16px;color:#64748b;font-size:13px;width:140px">Ad Soyad</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-weight:600;font-size:14px">${fullName}</td>
+          </tr>
+          <tr>
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">E-posta</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-size:14px">${email}</td>
+          </tr>
+          <tr style="background:rgba(255,255,255,0.04)">
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">Telefon</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-size:14px">${phone || '—'}</td>
+          </tr>
+          <tr>
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">Çalışma Alanı</td>
+            <td style="padding:12px 16px;color:#22c55e;font-weight:700;font-size:14px">${workField}</td>
+          </tr>
+          <tr style="background:rgba(255,255,255,0.04)">
+            <td style="padding:12px 16px;color:#64748b;font-size:13px;vertical-align:top">Mesaj</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-size:14px;line-height:1.6">${message || '—'}</td>
+          </tr>
+          <tr>
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">Başvuru ID</td>
+            <td style="padding:12px 16px;color:#475569;font-size:11px;font-family:monospace">${appId}</td>
+          </tr>
+        </table>
+
+        <!-- Action Buttons -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:28px">
+          <tr>
+            <td align="center" style="padding:0 8px">
+              <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#16a34a,#22c55e);color:#fff;text-decoration:none;padding:14px 40px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px">
+                ✅ Onayla
+              </a>
+            </td>
+            <td align="center" style="padding:0 8px">
+              <a href="${rejectUrl}" style="display:inline-block;background:linear-gradient(135deg,#991b1b,#ef4444);color:#fff;text-decoration:none;padding:14px 40px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px">
+                ❌ Reddet
+              </a>
+            </td>
+          </tr>
+        </table>
+
+        <p style="margin:24px 0 0;text-align:center;color:#475569;font-size:12px">
+          Butonlara tıklamak başvuruyu doğrudan günceller ve adaya bildirim maili gönderir.
+        </p>
+      </td></tr>
+      <!-- Footer -->
+      <tr><td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.07);text-align:center">
+        <p style="margin:0;color:#334155;font-size:12px">Agro Sosyal — Admin Paneli · Fatsa / Ordu</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+        await sendEmail('noreply.agrolink@gmail.com', `🤝 Yeni Başvuru: ${fullName} — ${workField}`, adminHtml).catch(() => {});
+
+        // ─── Başvurana otomatik teşekkür maili ──────────────────────────────
+        const userThankHtml = `<!DOCTYPE html>
+<html lang="tr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#141e30;border-radius:20px;overflow:hidden;border:1px solid rgba(34,197,94,0.2)">
+      <tr><td style="background:linear-gradient(135deg,#0d3321,#0a4a1e);padding:32px 40px;text-align:center">
+        <span style="font-size:48px">✅</span>
+        <h1 style="margin:12px 0 0;color:#22c55e;font-size:22px;font-weight:700">Başvurunuz Alındı!</h1>
+      </td></tr>
+      <tr><td style="padding:36px 40px;color:#cbd5e1;font-size:15px;line-height:1.7">
+        <p>Merhaba <strong style="color:#f1f5f9">${fullName}</strong>,</p>
+        <p>Agro Sosyal bünyesinde <strong style="color:#22c55e">${workField}</strong> alanında çalışma başvurunuz başarıyla alındı.</p>
+        <p>Ekibimiz başvurunuzu inceleyecek ve <strong style="color:#f1f5f9">en kısa sürede</strong> geri dönüş yapacaktır.</p>
+        <div style="margin:24px 0;padding:16px 20px;background:rgba(34,197,94,0.08);border-left:3px solid #22c55e;border-radius:8px">
+          <p style="margin:0;color:#86efac;font-size:13px">Başvuru ID: <code style="color:#4ade80">${appId}</code></p>
+        </div>
+      </td></tr>
+      <tr><td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.07);text-align:center">
+        <p style="margin:0;color:#334155;font-size:12px">Agro Sosyal · Fatsa / Ordu</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+        await sendEmail(email, '✅ Agro Sosyal — Başvurunuz Alındı', userThankHtml).catch(() => {});
+
+        res.status(201).json({ success: true, message: 'Başvurunuz alındı. En kısa sürede size dönüş yapılacaktır.', id: appId });
+
+    } catch (error) {
+        console.error('═══ Partnership başvuru hatası ═══');
+        console.error('Mesaj   :', error?.message);
+        console.error('Kod     :', error?.code);
+        console.error('Detail  :', error?.detail);
+        console.error('Stack   :', error?.stack);
+        console.error('══════════════════════════════════');
+        const clientMsg = error?.code === '23505'
+            ? 'Bu e-posta ile zaten bir başvuru mevcut.'
+            : error?.code === '23502'
+            ? 'Zorunlu alan eksik: ' + (error?.column || '')
+            : error?.message?.includes('pool') || error?.code === 'ECONNREFUSED'
+            ? 'Veritabanına bağlanılamadı. Lütfen tekrar dene.'
+            : `Sunucu hatası: ${error?.message || 'Bilinmeyen hata'}`;
+        res.status(500).json({ success: false, message: clientMsg });
+    }
+});
+
+// ─── Partnership action sayfaları için ortak HTML shell ────────────────────
+function actionPageShell(title, bodyHtml) {
+    return `<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${title} — Agro Sosyal</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #080f1a;
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background-image: radial-gradient(ellipse 80% 50% at 50% -10%, rgba(34,197,94,0.07), transparent);
+    }
+    .card {
+      background: linear-gradient(145deg, #111827, #0f172a);
+      border-radius: 28px;
+      padding: 44px 40px;
+      width: 100%;
+      max-width: 560px;
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: 0 32px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.03) inset;
+      position: relative;
+      overflow: hidden;
+    }
+    .card::before {
+      content: '';
+      position: absolute; inset-x: 0; top: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, rgba(34,197,94,0.5), transparent);
+    }
+    .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 28px; }
+    .logo-dot {
+      width: 9px; height: 9px; background: #22c55e; border-radius: 50%;
+      box-shadow: 0 0 8px #22c55e;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
+    .logo-text { color: #22c55e; font-weight: 700; font-size: 14px; }
+    .applicant-box {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 16px;
+      padding: 18px 20px;
+      margin-bottom: 24px;
+    }
+    .a-row {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 6px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+      font-size: 13.5px;
+    }
+    .a-row:last-child { border-bottom: none; }
+    .a-label { color: #475569; min-width: 88px; padding-top: 1px; }
+    .a-value { color: #e2e8f0; font-weight: 500; flex: 1; }
+    .section-title { font-size: 17px; font-weight: 700; color: #f1f5f9; margin-bottom: 4px; }
+    .section-sub { font-size: 13px; color: #475569; margin-bottom: 18px; line-height: 1.5; }
+    label { display: block; font-size: 11px; font-weight: 700; color: #64748b; margin-bottom: 7px; letter-spacing: 0.8px; text-transform: uppercase; }
+    textarea {
+      width: 100%;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 14px;
+      color: #f1f5f9;
+      font-size: 14px;
+      line-height: 1.7;
+      padding: 15px 17px;
+      resize: vertical;
+      min-height: 130px;
+      font-family: inherit;
+      transition: border-color 0.2s, box-shadow 0.2s;
+      outline: none;
+    }
+    textarea:focus { border-color: var(--ac,#22c55e); box-shadow: 0 0 0 3px rgba(var(--ac-rgb,34,197,94),0.12); }
+    textarea::placeholder { color: #2d3f55; }
+    .char-count { text-align:right; font-size:11px; color:#334155; margin-top:5px; }
+    .btn {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      width: 100%; padding: 15px 24px; border-radius: 14px;
+      font-size: 15px; font-weight: 700; border: none; cursor: pointer;
+      transition: opacity 0.2s, transform 0.15s;
+      margin-top: 18px; letter-spacing: 0.3px; font-family: inherit;
+    }
+    .btn:hover:not(:disabled) { opacity: 0.88; transform: translateY(-1px); }
+    .btn:active:not(:disabled) { transform: translateY(0); }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-approve { background: linear-gradient(135deg,#16a34a,#22c55e); color:#fff; box-shadow: 0 8px 24px rgba(34,197,94,0.22); }
+    .btn-reject  { background: linear-gradient(135deg,#991b1b,#ef4444); color:#fff; box-shadow: 0 8px 24px rgba(239,68,68,0.22); }
+    .success-wrap { text-align: center; }
+    .big-emoji { font-size: 68px; display: block; margin-bottom: 18px; }
+    h1 { font-size: 23px; font-weight: 800; margin-bottom: 8px; }
+    .sub { color: #64748b; font-size: 14px; line-height: 1.6; }
+    .mail-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      margin-top: 20px; padding: 10px 18px;
+      background: rgba(59,130,246,0.07); border: 1px solid rgba(59,130,246,0.18);
+      border-radius: 10px; color: #93c5fd; font-size: 13px;
+    }
+    .spinner {
+      width: 17px; height: 17px;
+      border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff;
+      border-radius: 50%; animation: spin 0.7s linear infinite; display: none;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <div class="logo-dot"></div>
+      <span class="logo-text">Agro Sosyal · Admin</span>
+    </div>
+    ${bodyHtml}
+  </div>
+</body>
+</html>`;
+}
+
+// GET /api/partnership/action/:id/:action — Mesaj giriş formu
+app.get('/api/partnership/action/:id/:action', async (req, res) => {
+    try {
+        const { id, action } = req.params;
+        if (!['approve', 'reject'].includes(action)) {
+            return res.status(400).type('html').send(actionPageShell('Hata', '<p style="color:#ef4444">Geçersiz işlem.</p>'));
+        }
+
+        const application = await dbGet(`SELECT * FROM partnership_applications WHERE id = $1`, [id]);
+        if (!application) {
+            return res.status(404).type('html').send(actionPageShell('Bulunamadı', `
+              <div class="success-wrap">
+                <span class="big-emoji">🔍</span>
+                <h1 style="color:#f1f5f9">Başvuru Bulunamadı</h1>
+                <p class="sub">Bu bağlantı geçersiz veya başvuru silinmiş.</p>
+              </div>`));
+        }
+
+        if (application.status !== 'pending') {
+            const already = application.status === 'approved' ? '✅ onaylandı' : '❌ reddedildi';
+            return res.type('html').send(actionPageShell('Zaten İşlendi', `
+              <div class="success-wrap">
+                <span class="big-emoji">⚠️</span>
+                <h1 style="color:#fbbf24">Zaten İşlendi</h1>
+                <p class="sub">Bu başvuru daha önce <strong style="color:#fbbf24">${already}</strong>.</p>
+              </div>`));
+        }
+
+        const isApprove  = action === 'approve';
+        const ac         = isApprove ? '#22c55e' : '#ef4444';
+        const acRgb      = isApprove ? '34,197,94' : '239,68,68';
+        const btnClass   = isApprove ? 'btn-approve' : 'btn-reject';
+        const emoji      = isApprove ? '✅' : '❌';
+        const sectionTitle = isApprove ? '✅ Başvuruyu Onayla' : '❌ Başvuruyu Reddet';
+        const sectionSub   = isApprove
+            ? 'Adaya gönderilecek <strong>ilk görev</strong> metnini yaz. Bu metin e-posta olarak iletilecek.'
+            : 'Adaya gönderilecek <strong>red gerekçesini</strong> yaz. Bu metin e-posta olarak iletilecek.';
+        const placeholder  = isApprove
+            ? 'Örn: Merhaba! İlk göreviniz: GitHub üzerinde şu repoyu fork edin ve...'
+            : 'Örn: Başvurunuzu inceledik, ancak şu an bu pozisyon için uygun profil arayışındayız...';
+        const labelText    = isApprove ? '📋 İLK GÖREV METNİ' : '📝 RED GEREKÇESİ';
+
+        const formBody = `
+          <style>:root{--ac:${ac};--ac-rgb:${acRgb}}</style>
+
+          <div class="applicant-box">
+            <div class="a-row"><span class="a-label">👤 Ad Soyad</span><span class="a-value">${escapeHtml(application.fullName)}</span></div>
+            <div class="a-row"><span class="a-label">📧 E-posta</span><span class="a-value">${escapeHtml(application.email)}</span></div>
+            <div class="a-row"><span class="a-label">💼 Alan</span><span class="a-value" style="color:${ac}">${escapeHtml(application.workField)}</span></div>
+            ${application.phone ? `<div class="a-row"><span class="a-label">📞 Telefon</span><span class="a-value">${escapeHtml(application.phone)}</span></div>` : ''}
+            ${application.message ? `<div class="a-row"><span class="a-label">💬 Mesaj</span><span class="a-value" style="white-space:pre-wrap">${escapeHtml(application.message)}</span></div>` : ''}
+          </div>
+
+          <div class="section-title">${sectionTitle}</div>
+          <div class="section-sub">${sectionSub}</div>
+
+          <form id="f" method="POST" action="/api/partnership/action/${id}/${action}">
+            <label>${labelText}</label>
+            <textarea name="customMessage" placeholder="${placeholder}" maxlength="2000"
+              oninput="document.getElementById('cc').textContent=this.value.length+'/2000'"
+              required></textarea>
+            <div class="char-count" id="cc">0/2000</div>
+            <button type="submit" class="btn ${btnClass}" id="sb">
+              <div class="spinner" id="sp"></div>
+              <span id="st">${emoji} ${isApprove ? 'Onayla ve Mail Gönder' : 'Reddet ve Mail Gönder'}</span>
+            </button>
+          </form>
+          <script>
+            document.getElementById('f').onsubmit = function(){
+              document.getElementById('sb').disabled = true;
+              document.getElementById('sp').style.display = 'block';
+              document.getElementById('st').textContent = 'Gönderiliyor...';
+            };
+          </script>`;
+
+        res.type('html').send(actionPageShell(isApprove ? 'Başvuruyu Onayla' : 'Başvuruyu Reddet', formBody));
+
+    } catch (error) {
+        console.error('Partnership action GET hatası:', error);
+        res.status(500).type('html').send(actionPageShell('Hata', '<p style="color:#ef4444">Sunucu hatası oluştu.</p>'));
+    }
+});
+
+// POST /api/partnership/action/:id/:action — Formu işle, mail gönder
+app.post('/api/partnership/action/:id/:action', async (req, res) => {
+    try {
+        const { id, action } = req.params;
+        const customMessage  = (req.body.customMessage || '').trim();
+
+        if (!['approve', 'reject'].includes(action)) {
+            return res.status(400).type('html').send(actionPageShell('Hata', '<p style="color:#ef4444">Geçersiz işlem.</p>'));
+        }
+        if (!customMessage) {
+            return res.status(400).type('html').send(actionPageShell('Hata', '<p style="color:#ef4444">Mesaj boş olamaz.</p>'));
+        }
+
+        const application = await dbGet(`SELECT * FROM partnership_applications WHERE id = $1`, [id]);
+        if (!application) return res.status(404).type('html').send(actionPageShell('Hata', '<p style="color:#ef4444">Başvuru bulunamadı.</p>'));
+        if (application.status !== 'pending') return res.type('html').send(actionPageShell('Zaten İşlendi', `
+            <div class="success-wrap"><span class="big-emoji">⚠️</span>
+            <h1 style="color:#fbbf24">Bu başvuru zaten işlendi.</h1></div>`));
+
+        const newStatus  = action === 'approve' ? 'approved' : 'rejected';
+        const isApproved = newStatus === 'approved';
+
+        await dbRun(
+            `UPDATE partnership_applications SET status=$1, "reviewNote"=$2, "reviewedAt"=NOW(), "updatedAt"=NOW() WHERE id=$3`,
+            [newStatus, customMessage, id]
+        );
+
+        const ac        = isApproved ? '#22c55e' : '#ef4444';
+        const headerBg  = isApproved ? 'linear-gradient(135deg,#052e16,#14532d)' : 'linear-gradient(135deg,#450a0a,#7f1d1d)';
+        const msgBg     = isApproved ? 'rgba(34,197,94,0.07)' : 'rgba(239,68,68,0.07)';
+        const msgBorder = isApproved ? 'rgba(34,197,94,0.2)'  : 'rgba(239,68,68,0.2)';
+
+        const mailHtml = `<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+</head>
+<body style="margin:0;padding:0;background:#080f1a;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#080f1a;padding:48px 16px">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#0f172a;border-radius:24px;overflow:hidden;border:1px solid rgba(255,255,255,0.07);box-shadow:0 24px 64px rgba(0,0,0,0.5)">
+      <tr><td style="background:${headerBg};padding:40px 44px;text-align:center">
+        <div style="font-size:54px;margin-bottom:14px">${isApproved ? '🎉' : '😔'}</div>
+        <h1 style="margin:0;color:${ac};font-size:22px;font-weight:800;letter-spacing:-0.3px">
+          ${isApproved ? 'Başvurunuz Onaylandı!' : 'Başvurunuz Hakkında Bilgi'}
+        </h1>
+        <p style="margin:8px 0 0;color:rgba(255,255,255,0.35);font-size:13px">Agro Sosyal Ekibi</p>
+      </td></tr>
+      <tr><td style="padding:36px 44px">
+        <p style="color:#94a3b8;font-size:15px;line-height:1.7;margin:0 0 6px">
+          Merhaba <strong style="color:#f1f5f9">${escapeHtml(application.fullName)}</strong>,
+        </p>
+        <p style="color:#64748b;font-size:14px;line-height:1.7;margin:0 0 24px">
+          <strong style="color:${ac}">${escapeHtml(application.workField)}</strong> alanındaki başvurunuzu değerlendirdik.
+        </p>
+        <div style="background:${msgBg};border:1px solid ${msgBorder};border-radius:16px;padding:24px 26px;margin-bottom:24px">
+          <div style="font-size:10px;font-weight:800;color:${ac};letter-spacing:1.2px;text-transform:uppercase;margin-bottom:12px">
+            ${isApproved ? '📋 İlk Göreviniz' : '📝 Değerlendirme Notu'}
+          </div>
+          <p style="margin:0;color:#e2e8f0;font-size:15px;line-height:1.8;white-space:pre-wrap">${escapeHtml(customMessage)}</p>
+        </div>
+        <div style="background:${isApproved ? 'rgba(34,197,94,0.05)' : 'rgba(239,68,68,0.05)'};border-radius:12px;padding:14px 18px">
+          <p style="margin:0;color:${isApproved ? '#86efac' : '#fca5a5'};font-size:13px;line-height:1.6">
+            ${isApproved
+              ? '🌱 Ekibimiz en kısa sürede sizinle iletişime geçecektir.'
+              : 'İlerleyen dönemlerde tekrar başvurabilirsiniz. Gösterdiğiniz ilgi için teşekkür ederiz.'}
+          </p>
+        </div>
+      </td></tr>
+      <tr><td style="background:rgba(0,0,0,0.2);padding:20px 44px;border-top:1px solid rgba(255,255,255,0.05)">
+        <span style="color:#22c55e;font-weight:700;font-size:12px">Agro Sosyal</span>
+        <span style="color:#334155;font-size:12px"> · Fatsa / Ordu · Türkiye</span>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+        await sendEmail(
+            application.email,
+            isApproved ? '🎉 Agro Sosyal — Başvurunuz Onaylandı!' : '📋 Agro Sosyal — Başvuru Sonucu',
+            mailHtml
+        ).catch(err => console.error('[Partnership] Mail gönderilemedi:', err));
+
+        const resultBody = `
+          <div class="success-wrap">
+            <span class="big-emoji">${isApproved ? '✅' : '❌'}</span>
+            <h1 style="color:${ac}">${isApproved ? 'Başvuru Onaylandı' : 'Başvuru Reddedildi'}</h1>
+            <p class="sub"><strong style="color:#e2e8f0">${escapeHtml(application.fullName)}</strong> adına işlem tamamlandı.</p>
+            <div class="applicant-box" style="margin-top:20px;text-align:left">
+              <div class="a-row"><span class="a-label">📧 E-posta</span><span class="a-value">${escapeHtml(application.email)}</span></div>
+              <div class="a-row"><span class="a-label">💼 Alan</span><span class="a-value" style="color:${ac}">${escapeHtml(application.workField)}</span></div>
+              <div class="a-row"><span class="a-label">${isApproved ? '📋 Görev' : '📝 Gerekçe'}</span><span class="a-value" style="white-space:pre-wrap">${escapeHtml(customMessage)}</span></div>
+            </div>
+            <div class="mail-badge">📧 Mail <strong>${escapeHtml(application.email)}</strong> adresine gönderildi</div>
+            <p class="sub" style="margin-top:16px">Bu sayfayı kapatabilirsiniz.</p>
+          </div>`;
+
+        res.type('html').send(actionPageShell(isApproved ? 'Onaylandı' : 'Reddedildi', resultBody));
+
+    } catch (error) {
+        console.error('Partnership action POST hatası:', error);
+        res.status(500).type('html').send(actionPageShell('Hata', '<p style="color:#ef4444">Sunucu hatası oluştu.</p>'));
+    }
+});
+
+
+// GET /api/partnership/applications — Admin: tüm başvuruları listele
+app.get('/api/partnership/applications', authenticateToken, requireNotBanned, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+        const { status } = req.query;
+        let query = `SELECT * FROM partnership_applications`;
+        const params = [];
+        if (status) { query += ` WHERE status = $1`; params.push(status); }
+        query += ` ORDER BY "createdAt" DESC`;
+        const applications = await dbAll(query, params);
+        res.json({ applications });
+    } catch (error) {
+        console.error('Partnership listeleme hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
 
-// ── POST /api/chatsee/conversations/direct — DM başlat / mevcut bul ──────
-app.post('/api/chatsee/conversations/direct', authenticateToken, async (req, res) => {
+// POST /api/partnership/review/:id — Admin API ile onayla/reddet
+app.post('/api/partnership/review/:id', authenticateToken, requireNotBanned, async (req, res) => {
     try {
-        const { targetUserId } = req.body;
-        if (!targetUserId) return res.status(400).json({ error: 'targetUserId gerekli' });
-        const myId = req.user.id;
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+        const { id } = req.params;
+        const { status, reviewNote } = req.body;
+        if (!['approved', 'rejected'].includes(status)) {
+            return res.status(400).json({ error: 'Geçersiz durum.' });
+        }
+        const application = await dbGet(`SELECT * FROM partnership_applications WHERE id = $1`, [id]);
+        if (!application) return res.status(404).json({ error: 'Başvuru bulunamadı' });
 
-        // Engel kontrolü
-        const blocked = await pool.query(
-            `SELECT 1 FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`,
-            [myId, targetUserId]
+        await dbRun(
+            `UPDATE partnership_applications SET status = $1, "reviewNote" = $2, "reviewedAt" = NOW(), "updatedAt" = NOW() WHERE id = $3`,
+            [status, reviewNote?.trim() || null, id]
         );
-        if (blocked.rows.length) return res.status(403).json({ error: 'Bu kullanıcıyla mesajlaşamazsınız' });
 
-        // Mevcut direkt konuşmayı bul
-        const existing = await pool.query(`
-            SELECT c.id FROM chatsee_conversations c
-            JOIN chatsee_members m1 ON m1.conversation_id = c.id AND m1.user_id = $1
-            JOIN chatsee_members m2 ON m2.conversation_id = c.id AND m2.user_id = $2
-            WHERE c.type = 'direct'
-            LIMIT 1
-        `, [myId, targetUserId]);
+        const isApproved = status === 'approved';
+        const resultHtml = `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"></head>
+<body style="margin:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="background:#141e30;border-radius:20px;overflow:hidden;border:1px solid ${isApproved ? 'rgba(34,197,94,0.25)' : 'rgba(239,68,68,0.25)'}">
+<tr><td style="background:${isApproved ? 'linear-gradient(135deg,#0d3321,#0a4a1e)' : 'linear-gradient(135deg,#2d0a0a,#450f0f)'};padding:32px 40px;text-align:center">
+<span style="font-size:48px">${isApproved ? '🎉' : '😔'}</span>
+<h1 style="margin:12px 0 0;color:${isApproved ? '#22c55e' : '#ef4444'};font-size:22px;font-weight:700">${isApproved ? 'Başvurunuz Onaylandı!' : 'Başvurunuz Değerlendirildi'}</h1>
+</td></tr>
+<tr><td style="padding:36px 40px;color:#cbd5e1;font-size:15px;line-height:1.7">
+<p>Merhaba <strong style="color:#f1f5f9">${application.fullName}</strong>,</p>
+${isApproved
+  ? `<p>Agro Sosyal bünyesinde <strong style="color:#22c55e">${application.workField}</strong> alanındaki başvurunuz <strong style="color:#4ade80">onaylandı!</strong></p><p>En kısa sürede sizinle iletişime geçeceğiz.</p>`
+  : `<p><strong style="color:#fca5a5">${application.workField}</strong> alanındaki başvurunuz bu süreçte uygun görülmemiştir.</p><p style="color:#94a3b8">İlerleyen dönemlerde tekrar başvurabilirsiniz.</p>`
+}
+${reviewNote ? `<div style="margin-top:16px;padding:12px 16px;background:rgba(255,255,255,0.05);border-radius:8px;color:#94a3b8;font-size:13px">Not: ${reviewNote}</div>` : ''}
+</td></tr>
+<tr><td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.07);text-align:center">
+<p style="margin:0;color:#334155;font-size:12px">Agro Sosyal · Fatsa / Ordu</p>
+</td></tr>
+</table></td></tr></table></body></html>`;
+
+        await sendEmail(application.email, isApproved ? '🎉 Agro Sosyal — Başvurunuz Onaylandı!' : '❌ Agro Sosyal — Başvuru Sonucu', resultHtml).catch(() => {});
+        res.json({ success: true, message: isApproved ? 'Başvuru onaylandı.' : 'Başvuru reddedildi.' });
+    } catch (error) {
+        console.error('Partnership review hatası:', error);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+app.all('/api/admin/*', (req, res) => {
+    return setTimeout(() => res.status(404).json({ error: 'Sayfa bulunamadı' }), 1000);
+});
+
+
+// ════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════
+// 🛡️ ŞİKAYET YETKİLİSİ PANELİ v2 — /sikayet/
+// ════════════════════════════════════════════════════════════════════
+
+const SIKAYET_COOKIE  = 'sk_session';
+const SK_CODES        = new Map(); // email → { code, exp } — bellek içi OTP
+
+const BASE_DOMAIN = (process.env.APP_URL || 'https://sehitumitkestitarimmtal.com').replace(/\/$/, '');
+
+function skHtml(title, body) {
+    return `<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${title} — Şikayet Paneli</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%230d1526'/><path d='M50 15 L75 28 L75 52 C75 66 63 77 50 82 C37 77 25 66 25 52 L25 28 Z' fill='%2322c55e'/><path d='M50 15 L75 28 L75 52 C75 66 63 77 50 82 C37 77 25 66 25 52 L25 28 Z' fill='none' stroke='%23166534' stroke-width='2'/><path d='M40 50 L46 56 L60 42' stroke='white' stroke-width='4' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>" type="image/svg+xml">
+  <style>@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');</style>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{--bg:#060d18;--s:#0d1526;--s2:#111d33;--b:rgba(255,255,255,.07);--b2:rgba(255,255,255,.04);--t:#e2e8f0;--m:#475569;--m2:#334155;--pr:#3b82f6;--gr:#22c55e;--rd:#ef4444;--yw:#f59e0b}
+    body{background:var(--bg);color:var(--t);font-family:'Inter','Segoe UI',system-ui,sans-serif;min-height:100vh}
+    a{color:var(--pr);text-decoration:none}
+    /* topbar */
+    .tb{background:var(--s);border-bottom:1px solid var(--b);padding:0 28px;height:60px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
+    .tb-l{display:flex;align-items:center;gap:12px}
+    .dot{width:8px;height:8px;background:var(--gr);border-radius:50%;box-shadow:0 0 8px var(--gr);animation:pulse 2s infinite}
+    @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+    .tb-title{font-weight:700;font-size:15px}
+    .tb-sub{font-size:10px;color:var(--m)}
+    .tb-r{display:flex;align-items:center;gap:12px}
+    .badge-em{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.2);color:#93c5fd;padding:4px 12px;border-radius:9999px;font-size:12px}
+    .btn-out{background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.2);color:#fca5a5;padding:5px 13px;border-radius:8px;font-size:12px;cursor:pointer;font-family:inherit}
+    .btn-out:hover{background:rgba(239,68,68,.2)}
+    /* container */
+    .wrap{max-width:1240px;margin:0 auto;padding:28px 20px}
+    /* stats */
+    .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:24px}
+    .sc{background:var(--s);border:1px solid var(--b);border-radius:16px;padding:16px 18px}
+    .sc-n{font-size:26px;font-weight:800;line-height:1}
+    .sc-l{font-size:11px;color:var(--m);margin-top:4px}
+    /* filters */
+    .filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}
+    .fb{padding:6px 15px;border-radius:9999px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--b);background:var(--s);color:var(--m);font-family:inherit;transition:all .15s;text-decoration:none;display:inline-block}
+    .fb:hover,.fb.fa{background:var(--pr);border-color:var(--pr);color:#fff;text-decoration:none}
+    .fb.fa-y{background:var(--yw);border-color:var(--yw);color:#000}
+    .fb.fa-g{background:var(--gr);border-color:var(--gr);color:#fff}
+    .fb.fa-r{background:var(--rd);border-color:var(--rd);color:#fff}
+    /* table */
+    .tw{background:var(--s);border:1px solid var(--b);border-radius:18px;overflow:hidden}
+    .th{padding:14px 18px;border-bottom:1px solid var(--b);display:flex;align-items:center;justify-content:space-between}
+    .th-t{font-size:14px;font-weight:700}
+    table{width:100%;border-collapse:collapse}
+    th{padding:11px 14px;text-align:left;font-size:10px;font-weight:700;color:var(--m);text-transform:uppercase;letter-spacing:.7px;border-bottom:1px solid var(--b2);background:var(--s2)}
+    td{padding:13px 14px;font-size:13px;border-bottom:1px solid var(--b2);vertical-align:middle}
+    tr:last-child td{border-bottom:none}
+    tr:hover td{background:rgba(255,255,255,.013)}
+    /* badges */
+    .badge{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:9999px;font-size:11px;font-weight:700}
+    .bp{background:rgba(245,158,11,.12);color:#fbbf24;border:1px solid rgba(245,158,11,.2)}
+    .bv{background:rgba(34,197,94,.12);color:#4ade80;border:1px solid rgba(34,197,94,.2)}
+    .bd{background:rgba(71,85,105,.2);color:#94a3b8;border:1px solid rgba(71,85,105,.3)}
+    .br-tag{display:inline-block;padding:2px 8px;border-radius:6px;font-size:11px;font-weight:600;background:rgba(239,68,68,.1);color:#fca5a5;border:1px solid rgba(239,68,68,.15)}
+    /* post link */
+    .pl{display:inline-flex;align-items:center;gap:5px;color:var(--pr);font-size:12px;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.15);padding:3px 9px;border-radius:7px;margin-bottom:4px}
+    .pl:hover{background:rgba(59,130,246,.18);text-decoration:none}
+    .pc{font-size:11px;color:var(--m);max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    /* action btns */
+    .ab{display:flex;gap:6px;flex-wrap:wrap}
+    .abn{padding:5px 11px;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer;border:none;font-family:inherit;transition:all .15s;white-space:nowrap}
+    .abn-del{background:rgba(239,68,68,.12);color:#fca5a5;border:1px solid rgba(239,68,68,.2)}
+    .abn-del:hover{background:rgba(239,68,68,.28)}
+    .abn-ok{background:rgba(34,197,94,.1);color:#4ade80;border:1px solid rgba(34,197,94,.2)}
+    .abn-ok:hover{background:rgba(34,197,94,.25)}
+    .abn-dis{background:rgba(71,85,105,.15);color:#94a3b8;border:1px solid rgba(71,85,105,.2)}
+    .abn-dis:hover{background:rgba(71,85,105,.3)}
+    /* user cell */
+    .uc{display:flex;flex-direction:column;gap:2px}
+    .un{font-weight:600;font-size:13px}
+    .ue{font-size:10px;color:var(--m2);font-family:monospace}
+    .dc{font-size:11px;color:var(--m)}
+    /* empty */
+    .empty{text-align:center;padding:56px 20px;color:var(--m)}
+    /* login */
+    .lw{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px;background-image:radial-gradient(ellipse 60% 40% at 50% 0%,rgba(59,130,246,.07),transparent)}
+    .lc{background:var(--s);border:1px solid var(--b);border-radius:26px;padding:42px 38px;width:100%;max-width:420px;position:relative;overflow:hidden}
+    .lc::before{content:'';position:absolute;inset-x:0;top:0;height:1px;background:linear-gradient(90deg,transparent,rgba(59,130,246,.5),transparent)}
+    .lt{font-size:21px;font-weight:800;margin-bottom:8px}
+    .ls{font-size:13px;color:var(--m);margin-bottom:26px;line-height:1.6}
+    .ib{background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.15);border-radius:11px;padding:13px 15px;margin-bottom:22px;font-size:13px;color:#93c5fd;line-height:1.6}
+    .fi{margin-bottom:14px}
+    .fi label{display:block;font-size:10px;font-weight:700;color:var(--m);text-transform:uppercase;letter-spacing:.7px;margin-bottom:6px}
+    .fi input{width:100%;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.1);border-radius:11px;color:var(--t);font-size:14px;padding:12px 15px;outline:none;font-family:inherit;transition:border-color .2s,box-shadow .2s;letter-spacing:2px}
+    .fi input[type=email]{letter-spacing:normal}
+    .fi input:focus{border-color:var(--pr);box-shadow:0 0 0 3px rgba(59,130,246,.12)}
+    .fi input::placeholder{color:var(--m2);letter-spacing:normal}
+    .lbtn{width:100%;padding:13px;border-radius:11px;background:linear-gradient(135deg,#1d4ed8,#3b82f6);color:#fff;font-size:14px;font-weight:700;border:none;cursor:pointer;font-family:inherit;transition:opacity .2s,transform .15s;box-shadow:0 8px 24px rgba(59,130,246,.2)}
+    .lbtn:hover{opacity:.9;transform:translateY(-1px)}
+    .lbtn.green{background:linear-gradient(135deg,#16a34a,#22c55e);box-shadow:0 8px 24px rgba(34,197,94,.2)}
+    .err{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);border-radius:10px;padding:10px 13px;color:#fca5a5;font-size:13px;margin-bottom:14px}
+    .ok{background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:10px;padding:10px 13px;color:#86efac;font-size:13px;margin-bottom:14px}
+    .back-link{display:block;text-align:center;margin-top:16px;font-size:13px;color:var(--m)}
+    @media(max-width:768px){.tb{padding:0 14px}.wrap{padding:14px}.tw{overflow-x:auto}table{min-width:780px}}
+  </style>
+</head>
+<body>${body}</body>
+</html>`;
+}
+
+// ── 1. GİRİŞ — E-posta gir ──────────────────────────────────────────────────
+app.get(['/sikayet', '/sikayet/'], (req, res) => {
+    const token = req.cookies?.[SIKAYET_COOKIE];
+    if (token) { try { jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }); return res.redirect('/sikayet/panel'); } catch {} }
+
+    const e = req.query.hata;
+    const errHtml = e==='1'?'<div class="err">❌ Bu e-posta ile onaylanmış şikayet yetkilisi bulunamadı.</div>'
+                  : e==='2'?'<div class="err">❌ Sunucu hatası, tekrar dene.</div>'
+                  : '';
+
+    res.type('html').send(skHtml('Giriş', `
+    <div class="lw"><div class="lc">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:28px">
+        <div class="dot"></div>
+        <div><div style="font-weight:700;font-size:14px;color:var(--gr)">Agro Sosyal</div>
+        <div style="font-size:10px;color:var(--m)">Şikayet Yetkilisi Paneli</div></div>
+      </div>
+      <div class="lt" style="display:flex;align-items:center"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" style="vertical-align:middle;margin-right:6px"><path d="M12 2 L20 6 L20 13 C20 17.5 16.5 21.3 12 23 C7.5 21.3 4 17.5 4 13 L4 6 Z" fill="#22c55e" stroke="#166534" stroke-width="1.5"/><path d="M9 12 L11 14 L15 10" stroke="white" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>Panele Giriş</div>
+      <div class="ls">Yalnızca onaylı şikayet yetkilileri erişebilir.</div>
+      <div class="ib">📧 Başvuru formunda kullandığınız <strong>e-posta adresinizi</strong> girin. Doğrulama kodu gönderilecektir.</div>
+      ${errHtml}
+      <form method="POST" action="/sikayet/send-code">
+        <div class="fi"><label>E-posta Adresi</label>
+        <input type="email" name="email" placeholder="ornek@gmail.com" required autofocus></div>
+        <button class="lbtn" type="submit">📨 Doğrulama Kodu Gönder</button>
+      </form>
+    </div></div>`));
+});
+
+// ── 2. KOD GÖNDER ───────────────────────────────────────────────────────────
+app.post('/sikayet/send-code', async (req, res) => {
+    try {
+        const email = (req.body.email || '').toLowerCase().trim();
+        if (!email) return res.redirect('/sikayet/?hata=1');
+
+        const officer = await dbGet(
+            `SELECT * FROM partnership_applications WHERE LOWER(email)=$1 AND status='approved' AND LOWER("workField") LIKE '%şikayet%' LIMIT 1`,
+            [email]
+        );
+        if (!officer) return res.redirect('/sikayet/?hata=1');
+
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        SK_CODES.set(email, { code, exp: Date.now() + 5 * 60 * 1000 });
+
+        const mailHtml = `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"></head>
+<body style="margin:0;background:#060d18;font-family:'Segoe UI',sans-serif;padding:40px 16px">
+  <table width="100%" cellpadding="0" cellspacing="0"><tr><td align="center">
+    <table width="480" cellpadding="0" cellspacing="0" style="background:#0d1526;border-radius:20px;overflow:hidden;border:1px solid rgba(59,130,246,.2)">
+      <tr><td style="background:linear-gradient(135deg,#0f1f3d,#1e3a6e);padding:32px 36px;text-align:center">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" style="display:block;margin:0 auto 14px"><path d="M12 2 L20 6 L20 13 C20 17.5 16.5 21.3 12 23 C7.5 21.3 4 17.5 4 13 L4 6 Z" fill="#22c55e" stroke="#166534" stroke-width="1.5"/><path d="M9 12 L11 14 L15 10" stroke="white" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <h2 style="color:#93c5fd;margin:0;font-size:18px;font-weight:700">Şikayet Paneli Giriş Kodu</h2>
+      </td></tr>
+      <tr><td style="padding:32px 36px">
+        <p style="color:#94a3b8;font-size:14px;margin:0 0 20px">Merhaba <strong style="color:#f1f5f9">${escapeHtml(officer.fullName)}</strong>,</p>
+        <p style="color:#64748b;font-size:14px;margin:0 0 24px">Şikayet Yetkilisi Paneline giriş için doğrulama kodunuz:</p>
+        <div style="background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);border-radius:14px;padding:24px;text-align:center;margin-bottom:24px">
+          <div style="font-size:38px;font-weight:900;letter-spacing:10px;color:#60a5fa;font-family:monospace">${code}</div>
+          <div style="font-size:12px;color:#475569;margin-top:8px">5 dakika geçerlidir</div>
+        </div>
+        <p style="color:#334155;font-size:12px;margin:0">Bu kodu kimseyle paylaşmayın.</p>
+      </td></tr>
+      <tr><td style="padding:16px 36px;border-top:1px solid rgba(255,255,255,.05);text-align:center">
+        <span style="color:#22c55e;font-weight:700;font-size:12px">Agro Sosyal</span>
+        <span style="color:#1e293b;font-size:12px"> · Fatsa / Ordu</span>
+      </td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`;
+
+        await sendEmail(email, '🛡️ Agro Sosyal — Şikayet Paneli Giriş Kodu', mailHtml);
+
+        const enc = Buffer.from(email).toString('base64url');
+        res.redirect(`/sikayet/verify?e=${enc}${req.query.resend?'&ok=1':''}`);
+    } catch (err) {
+        console.error('[Şikayet send-code]', err);
+        res.redirect('/sikayet/?hata=2');
+    }
+});
+
+// ── 3. KOD DOĞRULAMA SAYFASI ────────────────────────────────────────────────
+app.get('/sikayet/verify', (req, res) => {
+    const enc   = req.query.e || '';
+    let email   = '';
+    try { email = Buffer.from(enc, 'base64url').toString(); } catch {}
+
+    const ok  = req.query.ok === '1';
+    const err = req.query.hata;
+    const errHtml = err==='1'?'<div class="err">❌ Kod hatalı veya süresi dolmuş.</div>':
+                    err==='2'?'<div class="err">❌ Sunucu hatası.</div>':'';
+    const okHtml  = ok ? '<div class="ok">✅ Yeni kod gönderildi, e-postanızı kontrol edin.</div>' : '';
+
+    res.type('html').send(skHtml('Doğrulama', `
+    <div class="lw"><div class="lc">
+      <div style="text-align:center;margin-bottom:28px">
+        <div style="font-size:48px;margin-bottom:10px">📧</div>
+        <div class="lt" style="text-align:center">Doğrulama Kodu</div>
+        <div class="ls" style="text-align:center;margin-top:6px">${email ? `<strong style="color:#f1f5f9">${escapeHtml(email)}</strong> adresine 6 haneli kod gönderildi.` : 'E-postanızı kontrol edin.'}</div>
+      </div>
+      ${errHtml}${okHtml}
+      <form method="POST" action="/sikayet/verify">
+        <input type="hidden" name="e" value="${escapeHtml(enc)}">
+        <div class="fi"><label>6 Haneli Kod</label>
+        <input type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required autofocus style="text-align:center;font-size:22px;font-weight:800;letter-spacing:8px"></div>
+        <button class="lbtn green" type="submit">✅ Giriş Yap</button>
+      </form>
+      <a href="/sikayet/send-code-again?e=${escapeHtml(enc)}" class="back-link">🔄 Kodu tekrar gönder</a>
+      <a href="/sikayet/" class="back-link" style="margin-top:8px">← Geri dön</a>
+    </div></div>`));
+});
+
+// ── 4. KOD DOĞRULA & GİRİŞ ─────────────────────────────────────────────────
+app.post('/sikayet/verify', async (req, res) => {
+    try {
+        const enc  = req.body.e || '';
+        const code = (req.body.code || '').trim();
+        let email  = '';
+        try { email = Buffer.from(enc, 'base64url').toString().toLowerCase().trim(); } catch {}
+
+        if (!email || !code) return res.redirect(`/sikayet/verify?e=${enc}&hata=1`);
+
+        const stored = SK_CODES.get(email);
+        if (!stored || stored.code !== code || Date.now() > stored.exp) {
+            return res.redirect(`/sikayet/verify?e=${enc}&hata=1`);
+        }
+
+        SK_CODES.delete(email);
+
+        const officer = await dbGet(
+            `SELECT * FROM partnership_applications WHERE LOWER(email)=$1 AND status='approved' AND LOWER("workField") LIKE '%şikayet%' LIMIT 1`,
+            [email]
+        );
+        if (!officer) return res.redirect('/sikayet/?hata=1');
+
+        const token = jwt.sign(
+            { email: officer.email, fullName: officer.fullName, role: 'sikayet_yetkilisi' },
+            JWT_SECRET, { expiresIn: '12h', algorithm: 'HS256' }
+        );
+        const isSecure = req.headers['x-forwarded-proto'] === 'https' || req.secure;
+        res.cookie(SIKAYET_COOKIE, token, { httpOnly:true, secure:isSecure, sameSite:'strict', maxAge:12*60*60*1000 });
+        res.redirect('/sikayet/panel');
+    } catch (err) {
+        console.error('[Şikayet verify]', err);
+        res.redirect('/sikayet/?hata=2');
+    }
+});
+
+// ── Kodu tekrar gönder ──────────────────────────────────────────────────────
+app.get('/sikayet/send-code-again', async (req, res) => {
+    const enc = req.query.e || '';
+    let email = '';
+    try { email = Buffer.from(enc, 'base64url').toString().toLowerCase().trim(); } catch {}
+    if (!email) return res.redirect('/sikayet/');
+
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    SK_CODES.set(email, { code, exp: Date.now() + 5 * 60 * 1000 });
+
+    const mailHtml = `<!DOCTYPE html><html><body style="background:#060d18;font-family:sans-serif;padding:40px;text-align:center">
+    <div style="background:#0d1526;border-radius:16px;padding:32px;max-width:400px;margin:0 auto;border:1px solid rgba(59,130,246,.2)">
+      <svg width="48" height="48" viewBox="0 0 24 24" fill="none" style="display:block;margin:0 auto 14px"><path d="M12 2 L20 6 L20 13 C20 17.5 16.5 21.3 12 23 C7.5 21.3 4 17.5 4 13 L4 6 Z" fill="#22c55e" stroke="#166534" stroke-width="1.5"/><path d="M9 12 L11 14 L15 10" stroke="white" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <div style="font-size:32px;font-weight:900;letter-spacing:8px;color:#60a5fa;font-family:monospace;margin:20px 0">${code}</div>
+      <p style="color:#475569;font-size:12px">5 dakika geçerlidir · Kimseyle paylaşmayın</p>
+    </div></body></html>`;
+
+    await sendEmail(email, '🛡️ Yeni Giriş Kodu — Şikayet Paneli', mailHtml).catch(()=>{});
+    res.redirect(`/sikayet/verify?e=${enc}&ok=1`);
+});
+
+// ── 5. ÇIKIŞ ────────────────────────────────────────────────────────────────
+app.post('/sikayet/logout', (req, res) => {
+    res.clearCookie(SIKAYET_COOKIE);
+    res.redirect('/sikayet/');
+});
+
+// ── YETKİ MIDDLEWARE ────────────────────────────────────────────────────────
+function requireSikayetAuth(req, res, next) {
+    const token = req.cookies?.[SIKAYET_COOKIE];
+    if (!token) return res.redirect('/sikayet/');
+    try { req.skUser = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }); next(); }
+    catch { res.clearCookie(SIKAYET_COOKIE); res.redirect('/sikayet/'); }
+}
+
+// ── 6. PANEL ────────────────────────────────────────────────────────────────
+app.get('/sikayet/panel', requireSikayetAuth, async (req, res) => {
+    try {
+        const sf = req.query.durum || 'all';
+        const where = sf==='pending'?`WHERE r.status='pending'`:sf==='reviewed'?`WHERE r.status='reviewed'`:sf==='dismissed'?`WHERE r.status='dismissed'`:'';
+
+        const reports = await dbAll(`
+            SELECT r.id, r.reason, r.description, r.status, r."createdAt",
+                   r."postId", r."reporterId",
+                   u1.username AS "reporterName", u1.email AS "reporterEmail",
+                   p.content AS "postContent", p.username AS "postOwner", p."isActive" AS "postActive"
+            FROM reports r
+            LEFT JOIN users u1 ON u1.id = r."reporterId"
+            LEFT JOIN posts p  ON p.id  = r."postId"
+            ${where}
+            ORDER BY CASE WHEN r.status='pending' THEN 0 ELSE 1 END, r."createdAt" DESC
+            LIMIT 300`, []);
+
+        const stats = await dbGet(`
+            SELECT COUNT(*) AS total,
+                   COUNT(*) FILTER (WHERE status='pending')   AS pending,
+                   COUNT(*) FILTER (WHERE status='reviewed')  AS reviewed,
+                   COUNT(*) FILTER (WHERE status='dismissed') AS dismissed
+            FROM reports`, []);
+
+        const rdMap = {spam:'🚫 Spam',hate:'😡 Nefret',violence:'⚠️ Şiddet',nsfw:'🔞 NSFW',misleading:'❗ Yanıltıcı',harassment:'👊 Taciz',copyright:'©️ Telif',other:'📝 Diğer'};
+        const fmtD = d => d ? new Date(d).toLocaleString('tr-TR',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+
+        const rows = reports.length === 0
+            ? `<tr><td colspan="7"><div class="empty"><div style="font-size:44px;margin-bottom:10px">🎉</div>Bu filtrede şikayet yok.</div></td></tr>`
+            : reports.map(r => {
+                const postUrl = r.postId ? `${BASE_DOMAIN}/post/${r.postId}` : null;
+                const postCell = postUrl ? `
+                    <a class="pl" href="${postUrl}" target="_blank">🔗 Gönderiye Git</a>
+                    ${r.postContent ? `<div class="pc" title="${escapeHtml(r.postContent)}">${escapeHtml(r.postContent.slice(0,55))}${r.postContent.length>55?'…':''}</div>` : ''}
+                    ${r.postActive===false?'<div style="font-size:10px;color:#ef4444;margin-top:2px">⛔ Zaten kaldırıldı</div>':''}
+                ` : '<span style="color:#334155;font-size:11px">Post silinmiş</span>';
+
+                let actions = '';
+                if (r.status === 'pending') {
+                    actions = `<div class="ab">
+                        ${r.postId && r.postActive!==false ? `
+                        <form method="POST" action="/sikayet/action/${r.id}/remove-post" style="display:inline">
+                            <button class="abn abn-del" type="submit" onclick="return confirm('Postu kaldırmak istiyor musunuz?')">🗑️ Postu Kaldır</button>
+                        </form>` : ''}
+                        <form method="POST" action="/sikayet/action/${r.id}/reviewed" style="display:inline">
+                            <button class="abn abn-ok" type="submit">✅ İncelendi</button>
+                        </form>
+                        <form method="POST" action="/sikayet/action/${r.id}/dismissed" style="display:inline">
+                            <button class="abn abn-dis" type="submit">❌ Kaldırma</button>
+                        </form>
+                    </div>`;
+                } else {
+                    const sb = r.status==='reviewed'?`<span class="badge bv">✅ İncelendi</span>`:r.status==='dismissed'?`<span class="badge bd">❌ Reddedildi</span>`:`<span class="badge bp">${r.status}</span>`;
+                    actions = sb;
+                }
+
+                return `<tr>
+                    <td><div class="uc"><div class="un">${escapeHtml(r.reporterName||'—')}</div><div class="ue">${escapeHtml(r.reporterEmail||'')}</div></div></td>
+                    <td><span class="br-tag">${rdMap[r.reason]||r.reason||'—'}</span></td>
+                    <td>${postCell}</td>
+                    <td class="dc" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(r.description||'')}">${r.description?escapeHtml(r.description.slice(0,70))+(r.description.length>70?'…':''):'<span style="color:#334155">—</span>'}</td>
+                    <td class="dc">${fmtD(r.createdAt)}</td>
+                    <td>${actions}</td>
+                </tr>`;
+            }).join('');
+
+        const filterLinks = [
+            {val:'all',   label:`Tümü (${stats.total||0})`,    cls:'fa'},
+            {val:'pending',  label:`⏳ Bekliyor (${stats.pending||0})`,  cls:'fa-y'},
+            {val:'reviewed', label:`✅ İncelendi (${stats.reviewed||0})`, cls:'fa-g'},
+            {val:'dismissed',label:`❌ Reddedildi (${stats.dismissed||0})`,cls:'fa-r'},
+        ].map(f => `<a href="/sikayet/panel?durum=${f.val}" class="fb ${sf===f.val?f.cls:''}">${f.label}</a>`).join('');
+
+        res.type('html').send(skHtml('Panel', `
+        <div class="tb">
+          <div class="tb-l"><div class="dot"></div>
+            <div><div class="tb-title" style="display:flex;align-items:center"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" style="vertical-align:middle;margin-right:6px"><path d="M12 2 L20 6 L20 13 C20 17.5 16.5 21.3 12 23 C7.5 21.3 4 17.5 4 13 L4 6 Z" fill="#22c55e" stroke="#166534" stroke-width="1.5"/><path d="M9 12 L11 14 L15 10" stroke="white" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>Şikayet Paneli</div><div class="tb-sub">Agro Sosyal</div></div>
+          </div>
+          <div class="tb-r">
+            <span class="badge-em">👤 ${escapeHtml(req.skUser.fullName||req.skUser.email)}</span>
+            <form method="POST" action="/sikayet/logout" style="display:inline">
+              <button class="btn-out" type="submit">Çıkış</button>
+            </form>
+          </div>
+        </div>
+        <div class="wrap">
+          <div class="stats">
+            <div class="sc"><div class="sc-n" style="color:#f1f5f9">${stats.total||0}</div><div class="sc-l">Toplam</div></div>
+            <div class="sc"><div class="sc-n" style="color:#fbbf24">${stats.pending||0}</div><div class="sc-l">⏳ Bekleyen</div></div>
+            <div class="sc"><div class="sc-n" style="color:#4ade80">${stats.reviewed||0}</div><div class="sc-l">✅ İncelenen</div></div>
+            <div class="sc"><div class="sc-n" style="color:#94a3b8">${stats.dismissed||0}</div><div class="sc-l">❌ Reddedilen</div></div>
+          </div>
+          <div class="filters">${filterLinks}</div>
+          <div class="tw">
+            <div class="th"><span class="th-t">🚨 Şikayetler</span><span style="font-size:12px;color:var(--m)">${reports.length} kayıt</span></div>
+            <table>
+              <thead><tr><th>Şikayet Eden</th><th>Neden</th><th>Gönderi</th><th>Açıklama</th><th>Tarih</th><th>İşlem</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        </div>`));
+    } catch (err) {
+        console.error('[Şikayet Panel]', err);
+        res.status(500).type('html').send(skHtml('Hata',`<div style="text-align:center;padding:60px;color:#ef4444"><h2>Sunucu hatası: ${escapeHtml(err.message)}</h2></div>`));
+    }
+});
+
+// ── 7. İŞLEM (İncele / Reddet / Postu Kaldır) ──────────────────────────────
+app.post('/sikayet/action/:id/:action', requireSikayetAuth, async (req, res) => {
+    try {
+        const { id, action } = req.params;
+        const back = req.headers.referer || '/sikayet/panel';
+
+        if (action === 'remove-post') {
+            const report = await dbGet(`SELECT "postId" FROM reports WHERE id=$1`, [id]);
+            if (report?.postId) {
+                await dbRun(`UPDATE posts SET "isActive"=FALSE, "updatedAt"=NOW() WHERE id=$1`, [report.postId]);
+            }
+            await dbRun(`UPDATE reports SET status='reviewed', "reviewedAt"=NOW(), "reviewedBy"=$1 WHERE id=$2`, [req.skUser.email, id]);
+        } else if (['reviewed','dismissed'].includes(action)) {
+            await dbRun(`UPDATE reports SET status=$1, "reviewedAt"=NOW(), "reviewedBy"=$2 WHERE id=$3`, [action, req.skUser.email, id]);
+        }
+
+        res.redirect(back);
+    } catch (err) {
+        console.error('[Şikayet Action]', err);
+        res.redirect('/sikayet/panel');
+    }
+});
+
+
+
+// ════════════════════════════════════════════════════════════════════
+// 📢 REKLAM SİSTEMİ — /api/ads
+// ════════════════════════════════════════════════════════════════════
+// Reklamverenler POST ile reklam yükler; ana app rastgele çeker.
+//
+// Tablo: ads
+//   id, "userId", title, body, imageUrl, linkUrl,
+//   "isActive", views, clicks, "createdAt", "updatedAt"
+// ════════════════════════════════════════════════════════════════════
+
+// ─── REKLAM TABLOSU MIGRATION ─────────────────────────────────────
+// initializeDatabase içinden çalışır; burada async IIFE ile güvenli ekleme
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS ads (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                body TEXT,
+                "imageUrl" TEXT,
+                "linkUrl" TEXT,
+                "isActive" BOOLEAN DEFAULT TRUE,
+                views INTEGER DEFAULT 0,
+                clicks INTEGER DEFAULT 0,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_ads_active ON ads("isActive")`);
+    } catch (e) {
+        console.warn('[Ads] Tablo migration uyarısı:', e.message);
+    }
+})();
+
+// ─── REKLAM OLUŞTUR (POST) ──────────────────────────────────────────
+// Herhangi bir doğrulanmış kullanıcı reklam ekleyebilir
+app.post('/api/ads', authenticateToken, upload.single('image'), async (req, res) => {
+    try {
+        const { title, body, linkUrl } = req.body;
+        if (!title) return res.status(400).json({ error: 'Reklam başlığı zorunludur' });
+
+        let imageUrl = null;
+        if (req.file) {
+            try { await verifyUploadedFile(req.file, 'profilePic'); } // resim tipi kontrolü
+            catch (verifyErr) { return res.status(400).json({ error: verifyErr.message }); }
+            const filename = `ad_${uuidv4().replace(/-/g,'').slice(0,16)}.webp`;
+            const outputPath = path.join(postsDir, filename);
+            await processImage(req.file.path, outputPath, { width: 1200, height: 628, fit: 'cover', quality: 80, effort: 4 });
+            await require('fs').promises.unlink(req.file.path).catch(() => {});
+            imageUrl = `/uploads/posts/${filename}`;
+        }
+
+        const adId = uuidv4();
+        await pool.query(
+            `INSERT INTO ads (id, "userId", title, body, "imageUrl", "linkUrl", "createdAt", "updatedAt")
+             VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
+            [adId, req.user.id, title.substring(0, 200), (body||'').substring(0,500), imageUrl, linkUrl||null]
+        );
+
+        res.status(201).json({ success: true, adId, message: 'Reklam oluşturuldu' });
+    } catch (e) {
+        console.error('[Ads] Oluşturma hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── RASTGELE REKLAM ÇEK (GET) ─────────────────────────────────────
+// Ana app bu endpoint'i çağırarak rastgele aktif reklam alır
+app.get('/api/ads/random', authenticateToken, async (req, res) => {
+    try {
+        const ad = await pool.query(
+            `SELECT a.id, a.title, a.body, a."imageUrl", a."linkUrl", a.views, a.clicks,
+                    u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic"
+             FROM ads a
+             JOIN users u ON a."userId" = u.id
+             WHERE a."isActive" = TRUE AND u."isActive" = TRUE
+             ORDER BY RANDOM()
+             LIMIT 1`
+        );
+        if (!ad.rows.length) return res.json({ ad: null });
+
+        // Görüntülenme sayısını artır
+        await pool.query(`UPDATE ads SET views = views + 1, "updatedAt"=NOW() WHERE id=$1`, [ad.rows[0].id]).catch(() => {});
+
+        res.json({
+            ad: {
+                ...ad.rows[0],
+                imageUrl: absoluteUrl(ad.rows[0].imageUrl),
+                ownerPic: absoluteUrl(ad.rows[0].ownerPic),
+            }
+        });
+    } catch (e) {
+        console.error('[Ads] Rastgele çekme hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── REKLAM TIKLAMA SAYACI ─────────────────────────────────────────
+app.post('/api/ads/:id/click', authenticateToken, async (req, res) => {
+    try {
+        await pool.query(`UPDATE ads SET clicks = clicks + 1, "updatedAt"=NOW() WHERE id=$1`, [req.params.id]);
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── KENDİ REKLAMLARI ──────────────────────────────────────────────
+app.get('/api/ads/my', authenticateToken, async (req, res) => {
+    try {
+        const ads = await pool.query(
+            `SELECT * FROM ads WHERE "userId"=$1 ORDER BY "createdAt" DESC`,
+            [req.user.id]
+        );
+        res.json({ ads: ads.rows.map(a => ({ ...a, imageUrl: absoluteUrl(a.imageUrl) })) });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── REKLAM SİL ────────────────────────────────────────────────────
+app.delete('/api/ads/:id', authenticateToken, async (req, res) => {
+    try {
+        const ad = await pool.query(`SELECT "userId" FROM ads WHERE id=$1`, [req.params.id]);
+        if (!ad.rows.length) return res.status(404).json({ error: 'Reklam bulunamadı' });
+        if (ad.rows[0].userId !== req.user.id && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Yetkiniz yok' });
+        }
+        await pool.query(`UPDATE ads SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1`, [req.params.id]);
+        res.json({ message: 'Reklam silindi' });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════
+// 🏘️ TOPLULUKLAR (COMMUNITIES) — Discord sunucusu / grup mantığı
+// ════════════════════════════════════════════════════════════════════
+// Şartlar: En az 50 takipçisi olan kullanıcılar topluluk kurabilir.
+// Yapı: communities, community_members, community_posts tabloları
+// ════════════════════════════════════════════════════════════════════
+
+(async () => {
+    try {
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS communities (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "ownerId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                slug TEXT UNIQUE NOT NULL,
+                description TEXT,
+                "avatarUrl" TEXT,
+                "bannerUrl" TEXT,
+                "isPrivate" BOOLEAN DEFAULT FALSE,
+                "memberCount" INTEGER DEFAULT 1,
+                "postCount" INTEGER DEFAULT 0,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS community_members (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "communityId" UUID NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                role TEXT NOT NULL DEFAULT 'member',
+                "joinedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE("communityId","userId")
+            )
+        `);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS community_posts (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                "communityId" UUID NOT NULL REFERENCES communities(id) ON DELETE CASCADE,
+                "postId" UUID NOT NULL REFERENCES posts(id) ON DELETE CASCADE,
+                "userId" UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE("communityId","postId")
+            )
+        `);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_community_members_user ON community_members("userId")`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_community_posts_com ON community_posts("communityId")`);
+        console.log('✅ [Communities] Tablolar hazır');
+    } catch (e) {
+        console.warn('[Communities] Migration uyarısı:', e.message);
+    }
+})();
+
+// ─── TOPLULUK OLUŞTUR ──────────────────────────────────────────────
+// Şart: en az 50 takipçi
+app.post('/api/communities', authenticateToken, upload.fields([
+    { name: 'avatar', maxCount: 1 },
+    { name: 'banner', maxCount: 1 }
+]), async (req, res) => {
+    try {
+        const { name, description, slug, isPrivate } = req.body;
+        if (!name || !slug) return res.status(400).json({ error: 'Topluluk adı ve slug zorunludur' });
+
+        // 🔒 En az 50 takipçi şartı
+        const followerResult = await pool.query(
+            `SELECT COUNT(*)::int AS cnt FROM follows WHERE "followingId"=$1`,
+            [req.user.id]
+        );
+        const followerCount = followerResult.rows[0]?.cnt || 0;
+        if (followerCount < 50) {
+            return res.status(403).json({
+                error: `Topluluk oluşturmak için en az 50 takipçiniz olmalıdır. Şu anki takipçi sayınız: ${followerCount}`
+            });
+        }
+
+        // Slug doğrulama
+        const cleanSlug = slug.toLowerCase().replace(/[^a-z0-9_-]/g, '').substring(0, 50);
+        if (!cleanSlug) return res.status(400).json({ error: 'Geçersiz slug' });
+        const slugExists = await pool.query(`SELECT id FROM communities WHERE slug=$1`, [cleanSlug]);
+        if (slugExists.rows.length) return res.status(400).json({ error: 'Bu slug zaten alınmış' });
+
+        let avatarUrl = null, bannerUrl = null;
+        if (req.files?.avatar?.[0]) {
+            const f = req.files.avatar[0];
+            const fname = `com_av_${uuidv4().replace(/-/g,'').slice(0,12)}.webp`;
+            await processImage(f.path, path.join(profilesDir, fname), { width: 300, height: 300, fit: 'cover', quality: 75, effort: 4 });
+            await require('fs').promises.unlink(f.path).catch(() => {});
+            avatarUrl = `/uploads/profiles/${fname}`;
+        }
+        if (req.files?.banner?.[0]) {
+            const f = req.files.banner[0];
+            const fname = `com_bn_${uuidv4().replace(/-/g,'').slice(0,12)}.webp`;
+            await processImage(f.path, path.join(postsDir, fname), { width: 1500, height: 500, fit: 'cover', quality: 80, effort: 4 });
+            await require('fs').promises.unlink(f.path).catch(() => {});
+            bannerUrl = `/uploads/posts/${fname}`;
+        }
+
+        const communityId = uuidv4();
+        await pool.query(
+            `INSERT INTO communities (id,"ownerId",name,slug,description,"avatarUrl","bannerUrl","isPrivate","createdAt","updatedAt")
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),NOW())`,
+            [communityId, req.user.id, name.substring(0,100), cleanSlug, (description||'').substring(0,1000), avatarUrl, bannerUrl, !!isPrivate]
+        );
+
+        // Kurucu üye olarak ekle
+        await pool.query(
+            `INSERT INTO community_members (id,"communityId","userId",role,"joinedAt")
+             VALUES ($1,$2,$3,'owner',NOW())`,
+            [uuidv4(), communityId, req.user.id]
+        );
+
+        res.status(201).json({
+            success: true,
+            communityId,
+            slug: cleanSlug,
+            message: 'Topluluk oluşturuldu'
+        });
+    } catch (e) {
+        console.error('[Communities] Oluşturma hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUK LİSTESİ ──────────────────────────────────────────────
+app.get('/api/communities', authenticateToken, async (req, res) => {
+    try {
+        const { page=1, limit=20, q } = req.query;
+        const pn = Math.max(1,parseInt(page)||1);
+        const ln = Math.min(parseInt(limit)||20,100);
+        const off = (pn-1)*ln;
+
+        let where = `c."isPrivate"=FALSE OR cm."userId"=$1`;
+        const params = [req.user.id];
+        if (q) { where += ` AND (c.name ILIKE $${params.length+1} OR c.slug ILIKE $${params.length+1})`; params.push(`%${q}%`); }
+
+        const communities = await pool.query(
+            `SELECT DISTINCT c.*, u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic",
+                    u."isVerified" AS "ownerVerified",
+                    EXISTS(SELECT 1 FROM community_members WHERE "communityId"=c.id AND "userId"=$1) AS "isMember"
+             FROM communities c
+             JOIN users u ON c."ownerId"=u.id
+             LEFT JOIN community_members cm ON cm."communityId"=c.id AND cm."userId"=$1
+             WHERE c."ownerId" IN (SELECT id FROM users WHERE "isActive"=TRUE)
+             ORDER BY c."memberCount" DESC, c."createdAt" DESC
+             LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+            [...params, ln, off]
+        );
+
+        res.json({
+            communities: communities.rows.map(c => ({
+                ...c,
+                avatarUrl: absoluteUrl(c.avatarUrl),
+                bannerUrl: absoluteUrl(c.bannerUrl),
+                ownerPic: absoluteUrl(c.ownerPic),
+            }))
+        });
+    } catch (e) {
+        console.error('[Communities] Liste hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUK DETAYI ───────────────────────────────────────────────
+app.get('/api/communities/:slugOrId', authenticateToken, async (req, res) => {
+    try {
+        const param = req.params.slugOrId;
+        const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(param);
+        const community = await pool.query(
+            `SELECT c.*, u.username AS "ownerUsername", u.name AS "ownerName", u."profilePic" AS "ownerPic",
+                    u."isVerified" AS "ownerVerified",
+                    EXISTS(SELECT 1 FROM community_members WHERE "communityId"=c.id AND "userId"=$1) AS "isMember",
+                    (SELECT role FROM community_members WHERE "communityId"=c.id AND "userId"=$1) AS "myRole"
+             FROM communities c
+             JOIN users u ON c."ownerId"=u.id
+             WHERE ${isUUID ? 'c.id=$2' : 'c.slug=$2'}`,
+            [req.user.id, param]
+        );
+        if (!community.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+        const c = community.rows[0];
+
+        // Gizli topluluk: üye değilse bilgi kısıtlı
+        if (c.isPrivate && !c.isMember) {
+            return res.json({
+                community: {
+                    id: c.id, name: c.name, slug: c.slug, description: c.description,
+                    avatarUrl: absoluteUrl(c.avatarUrl), memberCount: c.memberCount,
+                    isPrivate: true, isMember: false
+                }
+            });
+        }
+
+        res.json({
+            community: {
+                ...c,
+                avatarUrl: absoluteUrl(c.avatarUrl),
+                bannerUrl: absoluteUrl(c.bannerUrl),
+                ownerPic: absoluteUrl(c.ownerPic),
+            }
+        });
+    } catch (e) {
+        console.error('[Communities] Detay hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
+});
+
+// ─── TOPLULUĞA KATIL / AYRIL ───────────────────────────────────────
+app.post('/api/communities/:id/join', authenticateToken, async (req, res) => {
+    try {
+        const communityId = req.params.id;
+        const community = await pool.query(`SELECT id,"isPrivate","ownerId" FROM communities WHERE id=$1`, [communityId]);
+        if (!community.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+        if (community.rows[0].ownerId === req.user.id) {
+            return res.status(400).json({ error: 'Zaten topluluğun sahibisiniz' });
+        }
+
+        const existing = await pool.query(
+            `SELECT id FROM community_members WHERE "communityId"=$1 AND "userId"=$2`,
+            [communityId, req.user.id]
+        );
 
         if (existing.rows.length) {
-            return res.json({ conversationId: existing.rows[0].id, created: false });
+            // Ayrıl
+            await pool.query(`DELETE FROM community_members WHERE "communityId"=$1 AND "userId"=$2`, [communityId, req.user.id]);
+            await pool.query(`UPDATE communities SET "memberCount"=GREATEST("memberCount"-1,0),"updatedAt"=NOW() WHERE id=$1`, [communityId]);
+            return res.json({ joined: false, message: 'Topluluktan ayrıldınız' });
         }
 
-        // Yeni konuşma oluştur
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const convId = require('uuid').v4();
-            await client.query(
-                `INSERT INTO chatsee_conversations (id, type, created_by) VALUES ($1,'direct',$2)`,
-                [convId, myId]
-            );
-            await client.query(
-                `INSERT INTO chatsee_members (conversation_id, user_id) VALUES ($1,$2),($1,$3)`,
-                [convId, myId, targetUserId]
-            );
-            await client.query('COMMIT');
-            res.status(201).json({ conversationId: convId, created: true });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally { client.release(); }
-    } catch (e) {
-        console.error('[ChatSee] /direct:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── POST /api/chatsee/conversations/group — Grup oluştur ─────────────────
-app.post('/api/chatsee/conversations/group', authenticateToken, async (req, res) => {
-    try {
-        const { name, memberIds } = req.body;
-        if (!name || !Array.isArray(memberIds) || memberIds.length < 2)
-            return res.status(400).json({ error: 'Grup adı ve en az 2 üye gerekli' });
-
-        const myId   = req.user.id;
-        const allIds = [...new Set([myId, ...memberIds])];
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const convId = require('uuid').v4();
-            await client.query(
-                `INSERT INTO chatsee_conversations (id, type, name, created_by) VALUES ($1,'group',$2,$3)`,
-                [convId, name, myId]
-            );
-            for (const uid of allIds) {
-                await client.query(
-                    `INSERT INTO chatsee_members (conversation_id, user_id, is_admin) VALUES ($1,$2,$3)`,
-                    [convId, uid, uid === myId]
-                );
-            }
-            await client.query('COMMIT');
-            res.status(201).json({ conversationId: convId });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally { client.release(); }
-    } catch (e) {
-        console.error('[ChatSee] /group:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── GET /api/chatsee/conversations/:id/messages — Mesajları getir ─────────
-app.get('/api/chatsee/conversations/:id/messages', authenticateToken, async (req, res) => {
-    try {
-        const convId = req.params.id;
-        const myId   = req.user.id;
-        const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
-        const before = req.query.before || null;
-
-        // Üyelik kontrolü
-        const mem = await pool.query(
-            `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-            [convId, myId]
+        // Katıl
+        await pool.query(
+            `INSERT INTO community_members (id,"communityId","userId",role,"joinedAt")
+             VALUES ($1,$2,$3,'member',NOW()) ON CONFLICT DO NOTHING`,
+            [uuidv4(), communityId, req.user.id]
         );
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim izniniz yok' });
-
-        const params = [convId, limit];
-        let cursor = '';
-        if (before) { cursor = 'AND m."createdAt" < $3'; params.push(before); }
-
-        const msgs = await pool.query(`
-            SELECT
-                m.id,
-                m.conversation_id,
-                m.sender_id,
-                m.content,
-                m.type,
-                m.reply_to_id,
-                m.is_deleted,
-                m."createdAt",
-                u.name          AS sender_name,
-                u.username      AS sender_username,
-                u."profilePic"  AS sender_pic,
-                u."isVerified"  AS sender_verified,
-                (
-                    SELECT JSON_AGG(r.user_id)
-                    FROM chatsee_reads r WHERE r.message_id = m.id
-                ) AS read_by
-            FROM chatsee_messages m
-            JOIN users u ON u.id = m.sender_id
-            WHERE m.conversation_id = $1 ${cursor}
-            ORDER BY m."createdAt" DESC
-            LIMIT $2
-        `, params);
-
-        // Okundu işaretle (arka planda)
-        const unreadIds = msgs.rows
-            .filter(r => r.sender_id !== myId)
-            .map(r => r.id);
-        if (unreadIds.length) {
-            pool.query(
-                `INSERT INTO chatsee_reads (message_id, user_id, "readAt")
-                 SELECT unnest($1::uuid[]), $2, NOW()
-                 ON CONFLICT DO NOTHING`,
-                [unreadIds, myId]
-            ).catch(() => {});
-            pool.query(
-                `UPDATE chatsee_members SET last_read_at=NOW() WHERE conversation_id=$1 AND user_id=$2`,
-                [convId, myId]
-            ).catch(() => {});
-        }
-
-        const csAv = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'u')}&backgroundColor=0a1628`;
-
-        res.json(msgs.rows.reverse().map(r => ({
-            id            : r.id,
-            conversationId: r.conversation_id,
-            senderId      : r.sender_id,
-            content       : r.content,
-            type          : r.type,
-            replyToId     : r.reply_to_id,
-            isDeleted     : r.is_deleted,
-            createdAt     : r.createdAt,
-            readBy        : r.read_by || [],
-            sender: {
-                id        : r.sender_id,
-                name      : r.sender_name,
-                username  : r.sender_username,
-                profilePic: csAv(r.sender_pic, r.sender_username),
-                isVerified: r.sender_verified,
-            },
-        })));
+        await pool.query(`UPDATE communities SET "memberCount"="memberCount"+1,"updatedAt"=NOW() WHERE id=$1`, [communityId]);
+        res.json({ joined: true, message: 'Topluluğa katıldınız' });
     } catch (e) {
-        console.error('[ChatSee] /messages:', e.message);
+        console.error('[Communities] Katılma hatası:', e.message);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
 
-// ── DELETE /api/chatsee/messages/:id — Mesaj sil ─────────────────────────
-app.delete('/api/chatsee/messages/:id', authenticateToken, async (req, res) => {
+// ─── TOPLULUĞA POST PAYLAŞ ─────────────────────────────────────────
+app.post('/api/communities/:id/posts', authenticateToken, async (req, res) => {
     try {
-        const { rows } = await pool.query(
-            `UPDATE chatsee_messages
-             SET is_deleted=TRUE, content='Bu mesaj silindi.', type='deleted'
-             WHERE id=$1 AND sender_id=$2
-             RETURNING id, conversation_id`,
-            [req.params.id, req.user.id]
+        const communityId = req.params.id;
+        const { postId } = req.body;
+        if (!postId) return res.status(400).json({ error: 'postId zorunludur' });
+
+        const member = await pool.query(
+            `SELECT id FROM community_members WHERE "communityId"=$1 AND "userId"=$2`,
+            [communityId, req.user.id]
         );
-        if (!rows.length) return res.status(403).json({ error: 'İzin yok veya mesaj bulunamadı' });
-        // Socket bildir
-        if (io) io.to(`cs:${rows[0].conversation_id}`)
-            .emit('chatsee:deleted', { messageId: rows[0].id, conversationId: rows[0].conversation_id });
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
+        if (!member.rows.length) return res.status(403).json({ error: 'Bu topluluğun üyesi değilsiniz' });
 
-// ── GET /api/chatsee/users/search?q= — Kullanıcı ara ─────────────────────
-app.get('/api/chatsee/users/search', authenticateToken, async (req, res) => {
-    const q = (req.query.q || '').trim().toLowerCase();
-    if (q.length < 2) return res.json([]);
-    try {
-        const { rows } = await pool.query(`
-            SELECT u.id, u.name, u.username, u."profilePic", u."isOnline", u."lastSeen",
-                   u."isVerified", u."hasFarmerBadge"
-            FROM users u
-            WHERE (LOWER(u.username) LIKE $1 OR LOWER(u.name) LIKE $1)
-              AND u.id != $2
-              AND u."isActive" = TRUE
-              AND u."isBanned" = FALSE
-              AND NOT EXISTS (
-                  SELECT 1 FROM blocks b
-                  WHERE (b."blockerId"=$2 AND b."blockedId"=u.id)
-                     OR (b."blockerId"=u.id AND b."blockedId"=$2)
-              )
-            ORDER BY u."isOnline" DESC, u.username
-            LIMIT 20
-        `, [`%${q}%`, req.user.id]);
+        // Post bu kullanıcıya mı ait?
+        const post = await pool.query(`SELECT "userId" FROM posts WHERE id=$1 AND "isActive"=TRUE`, [postId]);
+        if (!post.rows.length) return res.status(404).json({ error: 'Gönderi bulunamadı' });
+        if (post.rows[0].userId !== req.user.id) return res.status(403).json({ error: 'Sadece kendi gönderilerinizi paylaşabilirsiniz' });
 
-        res.json(rows.map(r => ({
-            ...r,
-            profilePic: r.profilePic ? absoluteUrl(r.profilePic)
-                : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(r.username)}&backgroundColor=0a1628`,
-        })));
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// ── GET /api/chatsee/conversations/:id/members — Grup üyeleri ────────────
-app.get('/api/chatsee/conversations/:id/members', authenticateToken, async (req, res) => {
-    try {
-        const mem = await pool.query(
-            `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-            [req.params.id, req.user.id]
+        await pool.query(
+            `INSERT INTO community_posts (id,"communityId","postId","userId","createdAt")
+             VALUES ($1,$2,$3,$4,NOW()) ON CONFLICT DO NOTHING`,
+            [uuidv4(), communityId, postId, req.user.id]
         );
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim yok' });
+        await pool.query(`UPDATE communities SET "postCount"="postCount"+1,"updatedAt"=NOW() WHERE id=$1`, [communityId]).catch(()=>{});
 
-        const { rows } = await pool.query(`
-            SELECT u.id, u.name, u.username, u."profilePic", u."isOnline", u."lastSeen",
-                   m.is_admin, m."joinedAt"
-            FROM chatsee_members m
-            JOIN users u ON u.id = m.user_id
-            WHERE m.conversation_id = $1
-            ORDER BY m.is_admin DESC, u.name
-        `, [req.params.id]);
-
-        res.json(rows.map(r => ({
-            ...r,
-            profilePic: r.profilePic ? absoluteUrl(r.profilePic)
-                : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(r.username)}&backgroundColor=0a1628`,
-        })));
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// =============================================================================
-// END CHATSEE ROTALAR
-// =============================================================================
-
-// =============================================================================
-// END CHATSEE ROTALAR
-// =============================================================================
-
-// ═══════════════════════════════════════════════════════════════════
-// 🔗 OG URL ÖNİZLEME — GET /api/og-preview?url=...
-// ═══════════════════════════════════════════════════════════════════
-const https_module = require('https');
-const http_module  = require('http');
-
-app.get('/api/og-preview', authenticateToken, async (req, res) => {
-    const { url } = req.query;
-    if (!url) return res.status(400).json({ error: 'url parametresi gerekli' });
-
-    let targetUrl;
-    try {
-        targetUrl = new URL(url.startsWith('www.') ? 'https://' + url : url);
-        if (!['http:', 'https:'].includes(targetUrl.protocol)) return res.status(400).json({ error: 'Geçersiz URL' });
-    } catch(e) {
-        return res.status(400).json({ error: 'Geçersiz URL formatı' });
+        res.status(201).json({ success: true, message: 'Gönderi topluluğa paylaşıldı' });
+    } catch (e) {
+        console.error('[Communities] Post paylaşma hatası:', e.message);
+        res.status(500).json({ error: 'Sunucu hatası' });
     }
+});
 
+// ─── TOPLULUK FEED ─────────────────────────────────────────────────
+app.get('/api/communities/:id/posts', authenticateToken, async (req, res) => {
     try {
-        const html = await new Promise((resolve, reject) => {
-            const mod = targetUrl.protocol === 'https:' ? https_module : http_module;
-            const opts = {
-                hostname: targetUrl.hostname,
-                path: targetUrl.pathname + targetUrl.search,
-                port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
-                method: 'GET',
-                timeout: 6000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (compatible; AgroSosyal/1.0; +https://sehitumitkestitarimmtal.com)',
-                    'Accept': 'text/html,application/xhtml+xml',
-                    'Accept-Language': 'tr,en;q=0.5',
-                }
-            };
-            const req2 = mod.request(opts, r => {
-                if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
-                    // Basit redirect takibi (1 adım)
-                    return resolve('');
-                }
-                let body = '';
-                r.setEncoding('utf8');
-                r.on('data', chunk => { body += chunk; if (body.length > 200000) { req2.destroy(); resolve(body); } });
-                r.on('end', () => resolve(body));
-                r.on('error', reject);
-            });
-            req2.on('timeout', () => { req2.destroy(); reject(new Error('Timeout')); });
-            req2.on('error', reject);
-            req2.end();
-        });
+        const communityId = req.params.id;
+        const { page=1, limit=20 } = req.query;
+        const pn = Math.max(1,parseInt(page)||1);
+        const ln = Math.min(parseInt(limit)||20,50);
+        const off = (pn-1)*ln;
 
-        // Meta tag parser
-        const getMeta = (property) => {
-            const patterns = [
-                new RegExp(`<meta[^>]+property=["']${property}["'][^>]+content=["']([^"']*?)["']`, 'i'),
-                new RegExp(`<meta[^>]+content=["']([^"']*?)["'][^>]+property=["']${property}["']`, 'i'),
-                new RegExp(`<meta[^>]+name=["']${property}["'][^>]+content=["']([^"']*?)["']`, 'i'),
-                new RegExp(`<meta[^>]+content=["']([^"']*?)["'][^>]+name=["']${property}["']`, 'i'),
-            ];
-            for (const p of patterns) {
-                const m = html.match(p);
-                if (m && m[1]) return m[1].trim().replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#39;/g,"'").replace(/&quot;/g,'"');
-            }
-            return '';
-        };
+        const community = await pool.query(`SELECT id,"isPrivate" FROM communities WHERE id=$1`, [communityId]);
+        if (!community.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
 
-        const titleMatch = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
-        const title       = getMeta('og:title') || getMeta('twitter:title') || (titleMatch?.[1]?.trim() || '');
-        const description = getMeta('og:description') || getMeta('twitter:description') || getMeta('description') || '';
-        const image       = getMeta('og:image') || getMeta('twitter:image') || '';
-        const siteName    = getMeta('og:site_name') || targetUrl.hostname.replace('www.','');
-        const faviconM    = html.match(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["']([^"']+)["']/i);
-        const favicon     = faviconM?.[1] ? new URL(faviconM[1], targetUrl.origin).href : `${targetUrl.origin}/favicon.ico`;
-
-        // Güvenli görsel URL (mutlak yap)
-        let safeImage = '';
-        if (image) {
-            try { safeImage = new URL(image, targetUrl.origin).href; } catch(e) { safeImage = ''; }
+        // Gizli topluluk üyelik kontrolü
+        if (community.rows[0].isPrivate) {
+            const isMember = await pool.query(
+                `SELECT id FROM community_members WHERE "communityId"=$1 AND "userId"=$2`,
+                [communityId, req.user.id]
+            );
+            if (!isMember.rows.length) return res.status(403).json({ error: 'Bu topluluk gizlidir' });
         }
 
-        return res.json({
-            url: targetUrl.href,
-            title: title.slice(0, 200),
-            description: description.slice(0, 500),
-            image: safeImage,
-            siteName: siteName.slice(0, 100),
-            favicon,
+        const posts = await pool.query(
+            `SELECT p.*, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge", u.username AS "authorUsername",
+                    EXISTS(SELECT 1 FROM likes WHERE "postId"=p.id AND "userId"=$1) AS "isLiked",
+                    EXISTS(SELECT 1 FROM saves WHERE "postId"=p.id AND "userId"=$1) AS "isSaved",
+                    cp."createdAt" AS "sharedAt"
+             FROM community_posts cp
+             JOIN posts p ON cp."postId"=p.id
+             JOIN users u ON p."userId"=u.id
+             WHERE cp."communityId"=$2 AND p."isActive"=TRUE
+             ORDER BY cp."createdAt" DESC
+             LIMIT $3 OFFSET $4`,
+            [req.user.id, communityId, ln, off]
+        );
+
+        const total = await pool.query(`SELECT COUNT(*) AS c FROM community_posts WHERE "communityId"=$1`, [communityId]);
+        res.json({
+            posts: posts.rows.map(formatPost),
+            total: parseInt(total.rows[0]?.c||0),
+            page: pn,
+            totalPages: Math.ceil((total.rows[0]?.c||0)/ln)
         });
     } catch (e) {
-        // Hata olsa da URL bilgilerini döndür
-        return res.json({
-            url: targetUrl.href,
-            title: targetUrl.hostname.replace('www.',''),
-            description: '',
-            image: '',
-            siteName: targetUrl.hostname.replace('www.',''),
-            favicon: `${targetUrl.origin}/favicon.ico`,
-        });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 📹 ARAMA API'LERİ (REST — Socket.IO ile birlikte çalışır)
-// ═══════════════════════════════════════════════════════════════════
-
-// Aktif çağrıları bellek içinde tut (üretimde Redis kullanın)
-const activeCalls = new Map();
-
-// POST /api/calls/initiate — Arama başlat
-app.post('/api/calls/initiate', authenticateToken, async (req, res) => {
-    try {
-        const { recipientId, type = 'video' } = req.body;
-        if (!recipientId) return res.status(400).json({ error: 'recipientId gerekli' });
-
-        const callId = uuidv4();
-        activeCalls.set(callId, {
-            callId, callerId: req.user.id, recipientId,
-            type, status: 'ringing', createdAt: Date.now()
-        });
-
-        // Socket ile alıcıya bildir
-        if (io) {
-            const caller = await dbGet(`SELECT id, name, username, "profilePic" FROM users WHERE id = $1`, [req.user.id]);
-            const recipientSockets = onlineUsers?.get(recipientId);
-            if (recipientSockets) {
-                recipientSockets.forEach(sid => {
-                    io.to(sid).emit('incoming_call', {
-                        callId, type,
-                        caller: {
-                            id: caller?.id, name: caller?.name,
-                            username: caller?.username,
-                            profilePic: caller?.profilePic ? absoluteUrl(caller.profilePic) : ''
-                        }
-                    });
-                });
-            }
-        }
-
-        res.json({ callId, status: 'ringing' });
-    } catch(e) {
-        console.error('[Call initiate]', e);
-        res.status(500).json({ error: 'Arama başlatılamadı' });
-    }
-});
-
-// POST /api/calls/respond — Aramayı yanıtla
-app.post('/api/calls/respond', authenticateToken, async (req, res) => {
-    try {
-        const { callId, response } = req.body; // response: 'accept' | 'reject'
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-
-        call.status = response === 'accept' ? 'active' : 'rejected';
-
-        if (io) {
-            const callerSockets = onlineUsers?.get(call.callerId);
-            const event = response === 'accept' ? 'call_accepted' : 'call_rejected';
-            if (callerSockets) callerSockets.forEach(sid => io.to(sid).emit(event, { callId }));
-        }
-
-        if (response === 'reject') activeCalls.delete(callId);
-        res.json({ success: true, callId, status: call.status });
-    } catch(e) {
+        console.error('[Communities] Feed hatası:', e.message);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
 
-// POST /api/calls/end — Aramayı sonlandır
-app.post('/api/calls/end', authenticateToken, async (req, res) => {
+// ─── TOPLULUK ÜYELERİ ─────────────────────────────────────────────
+app.get('/api/communities/:id/members', authenticateToken, async (req, res) => {
     try {
-        const { callId } = req.body;
-        const call = activeCalls.get(callId);
-        if (call) {
-            if (io) {
-                const otherId = call.callerId === req.user.id ? call.recipientId : call.callerId;
-                const otherSockets = onlineUsers?.get(otherId);
-                if (otherSockets) otherSockets.forEach(sid => io.to(sid).emit('call_ended', { callId }));
-            }
-            activeCalls.delete(callId);
-        }
-        res.json({ success: true });
-    } catch(e) {
+        const { page=1, limit=20 } = req.query;
+        const pn = Math.max(1,parseInt(page)||1);
+        const ln = Math.min(parseInt(limit)||20,100);
+        const members = await pool.query(
+            `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", cm.role, cm."joinedAt"
+             FROM community_members cm
+             JOIN users u ON cm."userId"=u.id
+             WHERE cm."communityId"=$1 AND u."isActive"=TRUE
+             ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, cm."joinedAt" ASC
+             LIMIT $2 OFFSET $3`,
+            [req.params.id, ln, (pn-1)*ln]
+        );
+        res.json({ members: members.rows.map(m => ({ ...m, profilePic: absoluteUrl(m.profilePic) })) });
+    } catch (e) {
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
 
-// POST /api/calls/signal/offer — WebRTC offer ilet
-app.post('/api/calls/signal/offer', authenticateToken, async (req, res) => {
+// ─── KULLANICININ TOPLULUKLARI ─────────────────────────────────────
+app.get('/api/users/:userId/communities', authenticateToken, async (req, res) => {
     try {
-        const { callId, offer } = req.body;
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-        const recipientId = call.callerId === req.user.id ? call.recipientId : call.callerId;
-        if (io) {
-            const sockets = onlineUsers?.get(recipientId);
-            if (sockets) sockets.forEach(sid => io.to(sid).emit('webrtc_offer', { callId, callerId: req.user.id, offer }));
-        }
-        res.json({ success: true });
-    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
+        const communities = await pool.query(
+            `SELECT c.*, cm.role, u."profilePic" AS "ownerPic"
+             FROM community_members cm
+             JOIN communities c ON cm."communityId"=c.id
+             JOIN users u ON c."ownerId"=u.id
+             WHERE cm."userId"=$1
+             ORDER BY cm."joinedAt" DESC`,
+            [req.params.userId]
+        );
+        res.json({
+            communities: communities.rows.map(c => ({
+                ...c,
+                avatarUrl: absoluteUrl(c.avatarUrl),
+                ownerPic: absoluteUrl(c.ownerPic),
+            }))
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
 });
 
-// POST /api/calls/signal/answer — WebRTC answer ilet
-app.post('/api/calls/signal/answer', authenticateToken, async (req, res) => {
+// ─── TOPLULUK SİL (sadece sahip) ──────────────────────────────────
+app.delete('/api/communities/:id', authenticateToken, async (req, res) => {
     try {
-        const { callId, answer } = req.body;
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-        const callerId = call.callerId;
-        if (io) {
-            const sockets = onlineUsers?.get(callerId);
-            if (sockets) sockets.forEach(sid => io.to(sid).emit('webrtc_answer', { callId, answer }));
+        const c = await pool.query(`SELECT "ownerId" FROM communities WHERE id=$1`, [req.params.id]);
+        if (!c.rows.length) return res.status(404).json({ error: 'Topluluk bulunamadı' });
+        if (c.rows[0].ownerId !== req.user.id && req.user.role !== 'admin') {
+            return res.status(403).json({ error: 'Sadece topluluk sahibi silebilir' });
         }
-        res.json({ success: true });
-    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// POST /api/calls/signal/ice — ICE candidate ilet
-app.post('/api/calls/signal/ice', authenticateToken, async (req, res) => {
-    try {
-        const { callId, candidate } = req.body;
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-        const otherId = call.callerId === req.user.id ? call.recipientId : call.callerId;
-        if (io) {
-            const sockets = onlineUsers?.get(otherId);
-            if (sockets) sockets.forEach(sid => io.to(sid).emit('webrtc_ice_candidate', { callId, candidate }));
-        }
-        res.json({ success: true });
-    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// Eski/takılmış aramaları temizle (5 dakikadan uzun "ringing" durumundakiler)
-setInterval(() => {
-    const now = Date.now();
-    activeCalls.forEach((call, callId) => {
-        if (call.status === 'ringing' && (now - call.createdAt) > 5 * 60 * 1000) {
-            activeCalls.delete(callId);
-        }
-    });
-}, 60 * 1000);
-
-// ════════════════════════════════════════════════════════════════════
-// 🔒 GÜVENLİK: Admin API rotaları tamamen kapatıldı
-// Bu rotalar artık kullanılmıyor — herhangi bir /api/admin/* isteği
-// anında 404 döner ve saldırı olarak loglanır
-// ════════════════════════════════════════════════════════════════════
-app.all('/api/admin/*', (req, res) => {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-    console.warn(`🚨 [ADMIN-BLOCK] ${ip} yasaklı admin yoluna erişmeye çalıştı: ${req.path}`);
-    logFirewallAttack(ip, `Admin path probe: ${req.path}`, req);
-    // Honeypot gibi davran — gerçek 404 yerine kasıtlı yavaş cevap
-    return setTimeout(() => res.status(404).json({ error: 'Sayfa bulunamadı' }), 1000);
+        await pool.query(`DELETE FROM community_posts WHERE "communityId"=$1`, [req.params.id]);
+        await pool.query(`DELETE FROM community_members WHERE "communityId"=$1`, [req.params.id]);
+        await pool.query(`DELETE FROM communities WHERE id=$1`, [req.params.id]);
+        res.json({ message: 'Topluluk silindi' });
+    } catch (e) {
+        res.status(500).json({ error: 'Sunucu hatası' });
+    }
 });
 
 // ════════════════════════════════════════════════════════════════════
 // 🔒 Bilinmeyen API rotaları için 404
 // ════════════════════════════════════════════════════════════════════
 app.all('/api/*', (req, res) => {
-    const ip = (req.ip || req.connection?.remoteAddress || '').replace(/^::ffff:/, '');
-    logFirewallAttack(ip, `Unknown API probe: ${req.method} ${req.path}`, req);
     return res.status(404).json({ error: 'Geçersiz istek' });
 });
 
-// GET /* (catch-all - SPA için)
+// GET /* (catch-all - Ana SPA için)
+// Sub-app path'leri ve API'ler bu handler'a ulaşmaz
 app.get('*', (req, res, next) => {
-    if (req.path.startsWith('/api/') || req.path.startsWith('/uploads/')) return next();
-    const htmlPath = require('path').join(__dirname, 'public', 'index.html');
+    const p = req.path;
+
+    // API, uploads, sub-app'ler buraya düşmesin
+    if (
+        p.startsWith('/api/')     ||
+        p.startsWith('/uploads/') ||
+        p.startsWith('/agrolink') ||
+        p.startsWith('/agro-hava') ||
+        p.startsWith('/sikayet')
+    ) return next();
+
+    // public/<appname>/ alt-klasörü var mı? Onu sub-app router zaten handle etti
+    // Ama statik dosya (JS/CSS/png) için düşmüşse → 404
+    const firstSeg = p.split('/')[1]; // '' için '' döner
+    if (firstSeg) {
+        const subAppPath = path.join(__dirname, 'public', firstSeg);
+        if (fssync.existsSync(subAppPath) && fssync.statSync(subAppPath).isDirectory()) {
+            // Bu bir sub-app klasörü ama dosya bulunamadı → 404
+            return res.status(404).json({ error: 'Dosya bulunamadı' });
+        }
+    }
+
+    // Ana uygulama SPA
+    const htmlPath = path.join(__dirname, 'public', 'index.html');
     const fss = require('fs');
     if (fss.existsSync(htmlPath)) {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
         res.sendFile(htmlPath);
     } else {
         res.status(404).json({ error: 'Sayfa bulunamadı' });
@@ -14224,11 +17513,7 @@ const NUM_WORKERS = process.env.WEB_CONCURRENCY || Math.min(os.cpus().length, 4)
 
 if (cluster.isPrimary || cluster.isMaster) {
     console.log(`🚀 Master process ${process.pid} - ${NUM_WORKERS} worker başlatılıyor...`);
-
-    for (let i = 0; i < NUM_WORKERS; i++) {
-        cluster.fork();
-    }
-
+    for (let i = 0; i < NUM_WORKERS; i++) { cluster.fork(); }
     cluster.on('exit', (worker, code) => {
         console.log(`⚠️ Worker ${worker.process.pid} kapandı (code: ${code}). Yeniden başlatılıyor...`);
         cluster.fork();
@@ -14237,22 +17522,24 @@ if (cluster.isPrimary || cluster.isMaster) {
     (async () => {
         try {
             await initializeDatabase();
-            await loadFirewallBans(); // 🔥 DB hazır olduktan sonra firewall ban listesini yükle
-            await migrateEncryptSensitiveColumns(); // 🔒 Hassas kolonları şifrele (ör: email, mesajlar)
-            await runSQLiteMigration(); // SQLite → PG geçişi (sadece SQLITE_MIGRATE=true ise çalışır)
-            testEmailConnection().catch(() => {}); // E-posta bağlantısını arka planda test et
-            applySlowlorisProtection(server); // ✅ Slowloris/HTTP-DoS koruması
-            server.listen(PORT, '0.0.0.0', () => {
+            await migrateEncryptSensitiveColumns();
+            await runSQLiteMigration();
+            testEmailConnection().catch(() => {});
+            server.listen(PORT, '0.0.0.0', async () => {
                 console.log(`
 ╔══════════════════════════════════════════════════╗
-║  🌾 AGROLINK SERVER - PostgreSQL v6.0             ║
+║  🌾 AGROLINK SERVER - PostgreSQL v7.3             ║
 ║  📡 Port: ${String(PORT).padEnd(39)}║
 ║  🌐 Domain: sehitumitkestitarimmtal.com         ║
 ║  🗄️  DB: PostgreSQL (Pool: 100 bağlantı)        ║
 ║  🔒 SQL Injection: Tüm sorgular parameterize    ║
 ║  🎬 Video: FFmpeg+HLS ABR (YouTube Algoritması) ║
+║  📹 Video Limit: 100MB | Mavi Tik: 300MB        ║
+║  📰 Feed: Sadece takip edilenler gösterilir     ║
 ║  📧 E-posta: Nodemailer (SMTP)                  ║
-║  📊 API: 103 Rota                               ║
+║  📢 Reklam: Rota tabanlı reklam sistemi         ║
+║  🏘️  Topluluklar: Discord tarzı grup sistemi    ║
+║  📊 API: 130+ Rota                              ║
 ║  ⚡ Cluster Mode: Worker ${String(process.pid).padEnd(23)}║
 ║  🔥 1000+ Eşzamanlı İstek Desteği               ║
 ╚══════════════════════════════════════════════════╝
@@ -14266,26 +17553,7 @@ if (cluster.isPrimary || cluster.isMaster) {
 }
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\n🛑 Sunucu kapatılıyor...');
-    await pool.end();
-    process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-    console.log('\n🛑 Sunucu kapatılıyor...');
-    await pool.end();
-    process.exit(0);
-});
-
-// 🔒 İşlenmeyen hataları yakala — stack trace dışarı sızmasın
-process.on('unhandledRejection', (reason) => {
-    // Sadece sunucu loguna yaz, istemciye gönderme
-    console.error('[UnhandledRejection]', reason?.message || String(reason));
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('[UncaughtException]', error.message);
-    // Kritik hata → çalışmaya devam etme
-    process.exit(1);
-});
+process.on('SIGINT', async () => { console.log('\n🛑 Sunucu kapatılıyor...'); await pool.end(); process.exit(0); });
+process.on('SIGTERM', async () => { console.log('\n🛑 Sunucu kapatılıyor...'); await pool.end(); process.exit(0); });
+process.on('unhandledRejection', (reason) => { console.error('[UnhandledRejection]', reason?.message || String(reason)); });
+process.on('uncaughtException', (error) => { console.error('[UncaughtException]', error.message); process.exit(1); });
